@@ -1,0 +1,44 @@
+# Пример файла .env для Smart_PDF_parser
+#
+# ВНИМАНИЕ: настоящий .env с боевыми ключами в Git не коммить!
+# Этот файл — только пример. Скопируйте его в .env и заполните
+# значениями для вашего контура.
+
+########################################
+# Авторизация и доступ к GigaChat через NGW
+########################################
+
+# Авторизационный ключ (Basic ...) для NGW.
+# Его вы получаете в личном кабинете GigaChat API.
+GIGA_ACCESS_KEY=Basic_xxx_your_authorization_key_xxx
+
+# Scope для получения токена.
+# Для промышленного контура обычно используется GIGACHAT_API_CORP.
+GIGA_CHAT_SCOPE=GIGACHAT_API_CORP
+
+# URL NGW для получения access_token
+GIGA_NGW_URL=https://ngw.devices.sberbank.ru:9443/api/v2/oauth
+
+
+########################################
+# Эндпоинты GigaChat API
+########################################
+
+# REST-эндпоинт для chat-completions
+GIGA_CHAT_COMPLETIONS_URL=https://gigachat.devices.sberbank.ru/api/v1/chat/completions
+
+# Эндпоинт для загрузки файлов (изображений) в хранилище
+GIGA_CHAT_FILES_URL=https://gigachat.devices.sberbank.ru/api/v1/files
+
+
+########################################
+# Модели GigaChat
+########################################
+
+# Текстовая модель для объединения инструкций, RAG-постобработки и т.п.
+GIGA_TEXT_MODEL=GigaChat-2-Pro
+
+# Мультимодальная модель для OCR/анализа изображений (если отличается)
+GIGA_VISION_MODEL=GigaChat-2-Pro
+
+
