@@ -25,6 +25,7 @@
 - `pdfs/` — каталог для входных PDF (игнорируется Git, создаёте сами).
 - `out/` — каталог для результатов (игнорируется Git, создаётся скриптом).
 - `docs/pipeline.drawio` — диаграмма пайплайна (открывается в [draw.io / diagrams.net](https://app.diagrams.net/)).
+- `generate_faq.py` — генерация FAQ‑вопросов по итоговой инструкции (`.md`) (3–5 вопросов на страницу).
 
 ### Установка
 
@@ -71,5 +72,33 @@ python process_pamphlets.py --pdf-dir pdfs --out-dir out
 - `instructions_incremental.md` — единый документ с накопленным контекстом, где каждая смысловая строка имеет тег `[SOURCE: page XXX]`.
 
 В конце работы скрипт выводит в терминал суммарное количество токенов, потраченных на все вызовы GigaChat за текущий запуск.
+
+### Генерация FAQ
+
+Сгенерировать 3–5 вопросов на страницу по итоговой инструкции:
+
+```bash
+python generate_faq.py --md out/<pdf>/instructions_merged.md
+```
+
+или по инкрементальному документу (если используете `[SOURCE: page XXX]`):
+
+```bash
+python generate_faq.py --md out/<pdf>/instructions_incremental.md
+```
+
+Параметр `--output-tokens` задаёт лимит `max_tokens` на один ответ модели (по умолчанию `10000`).
+
+Формат вывода FAQ:
+
+- `ВОПРОС: ...`
+- `ОТВЕТ: ...`
+- `[SOURCE - "Название памятки - номер слайда"]`
+
+Название памятки по умолчанию берётся из имени каталога `out/<памятка>/...`. При необходимости можно переопределить:
+
+```bash
+python generate_faq.py --md out/<pdf>/instructions_merged.md --pamphlet-name "Моя памятка"
+```
 
 

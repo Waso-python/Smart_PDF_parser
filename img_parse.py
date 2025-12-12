@@ -164,6 +164,7 @@ def giga_free_answer(
     access_token: str,
     sys_prompt: str = "Ты банковский работник, ответь на заданный вопрос максимально лаконично",
     history=None,
+    max_tokens: int | None = None,
 ) -> str:
     """
     Обычный текстовый запрос к GigaChat через REST (без картинок).
@@ -192,6 +193,8 @@ def giga_free_answer(
         "temperature": 0.01,
         "messages": messages,
     }
+    if isinstance(max_tokens, int):
+        payload["max_tokens"] = max_tokens
 
     headers = {
         "Authorization": f"Bearer {access_token}",
