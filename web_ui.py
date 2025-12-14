@@ -23,7 +23,8 @@ from generate_faq import generate_faq_for_pages, _build_doc_context
 
 load_dotenv()
 
-APP_DATA_DIR = Path(os.getenv("WEB_DATA_DIR", "web_data")).resolve()
+# По умолчанию складываем результаты Web UI в out/web/, чтобы было видно рядом с CLI-пайплайном.
+APP_DATA_DIR = Path(os.getenv("WEB_DATA_DIR", "out/web")).resolve()
 APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -304,6 +305,7 @@ DOC_HTML = """
       <div><strong>Температура:</strong> <code>{{ meta.get('temperature') }}</code></div>
       <div><strong>Токены total:</strong> <code>{{ meta.get('tokens', {}).get('total_tokens', 0) }}</code></div>
     </div>
+    <p class="muted"><strong>Каталог документа:</strong> <code>{{ meta.get('storage_dir','') }}</code></p>
     {% if meta.get('last_op') %}
       <p class="muted">Последняя операция: {{ meta['last_op']['type'] }} (стр. {{ meta['last_op'].get('page','-') }}), delta total={{ meta['last_op']['token_delta']['total_tokens'] }}</p>
     {% endif %}
@@ -368,10 +370,11 @@ PAGE_HTML = """
           <button type="submit">Обработать страницу (OCR+Merge + контекст)</button>
         </form>
         <form action="{{ url_for('faq_page', doc_id=doc_id, page_num=page_num) }}" method="post">
-          <button type="submit">Сгенерировать FAQ</button>
+          <button type="submit" {% if not has_instruction %}disabled{% endif %}>Сгенерировать FAQ</button>
         </form>
       </div>
     </div>
+    <p class="muted"><strong>Каталог страницы:</strong> <code>{{ page_dir }}</code></p>
     {% if meta.get('last_error') %}
       <p style="color:#b91c1c;"><strong>Ошибка:</strong> {{ meta['last_error'] }}</p>
     {% endif %}
@@ -475,6 +478,7 @@ def upload():
         "model": model,
         "temperature": temperature,
         "tokens": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "storage_dir": str(ddir),
     }
     _save_meta(doc_id, meta)
 
@@ -513,6 +517,7 @@ def page(doc_id: str, page_num: int):
     instruction = (pd / "instruction.txt").read_text(encoding="utf-8") if (pd / "instruction.txt").exists() else ""
     faq = (pd / "faq.md").read_text(encoding="utf-8") if (pd / "faq.md").exists() else ""
     has_img = (pd / "page.jpg").exists()
+    has_instruction = (pd / "instruction.txt").exists()
 
     return render_template_string(
         PAGE_HTML,
@@ -520,6 +525,8 @@ def page(doc_id: str, page_num: int):
         page_num=page_num,
         meta=meta,
         has_img=has_img,
+        has_instruction=has_instruction,
+        page_dir=str(pd),
         page_text=page_text,
         ocr_text=ocr_text,
         instruction=instruction,
