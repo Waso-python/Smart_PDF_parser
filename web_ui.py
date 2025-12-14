@@ -244,6 +244,23 @@ def _build_faq_export_md(doc_id: str) -> str:
     return "\n\n".join(chunks).strip() + "\n"
 
 
+def _missing_pages(doc_id: str, kind: str) -> list[int]:
+    """
+    kind:
+      - "instruction": проверяем наличие page_XXX/instruction.txt
+      - "faq": проверяем наличие page_XXX/faq.md
+    """
+    meta = _load_meta(doc_id)
+    pages = int(meta.get("pages", 0) or 0)
+    missing: list[int] = []
+    filename = "instruction.txt" if kind == "instruction" else "faq.md"
+    for p in range(1, pages + 1):
+        pd = _page_dir(doc_id, p)
+        if not (pd / filename).exists():
+            missing.append(p)
+    return missing
+
+
 app = Flask(__name__)
 app.secret_key = os.getenv("WEB_SECRET_KEY", "dev-secret")
 
@@ -381,6 +398,43 @@ DOC_HTML = """
       {% endfor %}
       </tbody>
     </table>
+  </div>
+</body>
+</html>
+"""
+
+WARNING_HTML = """
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <title>Предупреждение — неполная обработка</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 24px; }
+    .card { border: 1px solid #e5e7eb; border-radius: 12px; padding: 16px; margin-bottom: 16px; }
+    .warn { color: #b45309; font-weight: 700; }
+    code { background: #f3f4f6; padding: 2px 6px; border-radius: 6px; }
+    a.btn { display:inline-block; padding: 10px 14px; border-radius: 10px; text-decoration:none; margin-right: 10px; }
+    a.primary { background:#111827; color:#fff; }
+    a.secondary { background:#e5e7eb; color:#111827; }
+    ul { margin: 8px 0 0 18px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2 class="warn">Предупреждение</h2>
+    <p>Не по всем страницам выполнен разбор для выгрузки: <code>{{ kind_label }}</code>.</p>
+    <p>Документ: <code>{{ meta.get('pamphlet_name','document') }}</code>, страниц: <code>{{ meta.get('pages') }}</code></p>
+    <p>Отсутствуют страницы:</p>
+    <ul>
+      {% for p in missing %}
+        <li>{{ "%03d"|format(p) }}</li>
+      {% endfor %}
+    </ul>
+  </div>
+  <div class="card">
+    <a class="btn primary" href="{{ force_url }}">Скачать всё равно</a>
+    <a class="btn secondary" href="{{ back_url }}">Вернуться к документу</a>
   </div>
 </body>
 </html>
@@ -598,6 +652,16 @@ def download_instruction(doc_id: str):
     meta = _load_meta(doc_id)
     if not meta:
         abort(404)
+    missing = _missing_pages(doc_id, "instruction")
+    if missing and request.args.get("force") != "1":
+        return render_template_string(
+            WARNING_HTML,
+            meta=meta,
+            missing=missing,
+            kind_label="instruction.txt",
+            force_url=url_for("download_instruction", doc_id=doc_id, force=1),
+            back_url=url_for("doc", doc_id=doc_id),
+        )
     md = _build_instruction_export_md(doc_id)
     filename = f"{meta.get('pamphlet_name','document')}_instruction.md"
     return send_file(
@@ -613,6 +677,16 @@ def download_faq(doc_id: str):
     meta = _load_meta(doc_id)
     if not meta:
         abort(404)
+    missing = _missing_pages(doc_id, "faq")
+    if missing and request.args.get("force") != "1":
+        return render_template_string(
+            WARNING_HTML,
+            meta=meta,
+            missing=missing,
+            kind_label="faq.md",
+            force_url=url_for("download_faq", doc_id=doc_id, force=1),
+            back_url=url_for("doc", doc_id=doc_id),
+        )
     md = _build_faq_export_md(doc_id)
     filename = f"{meta.get('pamphlet_name','document')}_faq.md"
     return send_file(
