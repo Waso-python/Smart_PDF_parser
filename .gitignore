@@ -16,6 +16,7 @@ venv2/
 
 pdfs/
 out/
+web_data/
 
 *.DS_Store
 

@@ -26,6 +26,7 @@
 - `out/` — каталог для результатов (игнорируется Git, создаётся скриптом).
 - `docs/pipeline.drawio` — диаграмма пайплайна (открывается в [draw.io / diagrams.net](https://app.diagrams.net/)).
 - `generate_faq.py` — генерация FAQ‑вопросов по итоговой инструкции (`.md`) (3–5 вопросов на страницу).
+- `web_ui.py` — Web интерфейс: загрузка PDF → просмотр страниц (скриншот/тексты/FAQ), показ токенов, выбор model/temperature.
 
 ### Установка
 
@@ -100,5 +101,15 @@ python generate_faq.py --md out/<pdf>/instructions_incremental.md
 ```bash
 python generate_faq.py --md out/<pdf>/instructions_merged.md --pamphlet-name "Моя памятка"
 ```
+
+### Web интерфейс
+
+Запуск:
+
+```bash
+python web_ui.py
+```
+
+По умолчанию интерфейс поднимется на `127.0.0.1:8000` (настраивается через переменные `WEB_HOST` и `WEB_PORT` в `.env`).
 
 

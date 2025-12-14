@@ -41,4 +41,11 @@ GIGA_TEXT_MODEL=GigaChat-2-Pro
 # Мультимодальная модель для OCR/анализа изображений (если отличается)
 GIGA_VISION_MODEL=GigaChat-2-Pro
 
+# Температуры (опционально)
+GIGA_TEXT_TEMPERATURE=0.01
+GIGA_VISION_TEMPERATURE=0.01
+
+# Секрет для Web UI (Flask)
+WEB_SECRET_KEY=change_me
+
 

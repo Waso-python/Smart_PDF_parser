@@ -60,6 +60,8 @@ def stage2_build_instruction_for_page(
     text_path: Path,
     image_path: Path,
     access_token: str,
+    model: str | None = None,
+    temperature: float | None = None,
 ) -> str:
     """
     Этап 2.
@@ -69,7 +71,12 @@ def stage2_build_instruction_for_page(
     Возвращаем итоговую инструкцию как строку.
     """
     # 2.1. Получаем описание по скриншоту (мультимодальный вызов)
-    ocr_description = ocr_instruction_via_rest(str(image_path), access_token)
+    ocr_description = ocr_instruction_via_rest(
+        str(image_path),
+        access_token,
+        model=model,
+        temperature=temperature,
+    )
 
     # 2.2. Читаем текстовый слой страницы
     text_layer = text_path.read_text(encoding="utf-8")
@@ -112,6 +119,8 @@ def stage2_build_instruction_for_page(
         question=merge_question,
         access_token=access_token,
         sys_prompt=sys_prompt_merge,
+        model=model,
+        temperature=temperature,
     )
 
     return merged_instruction
@@ -145,7 +154,12 @@ def stage3_merge_pdf_instructions(pdf_dir: Path) -> Path:
     return merged_path
 
 
-def stage4_build_incremental_context(pdf_dir: Path, access_token: str) -> Path:
+def stage4_build_incremental_context(
+    pdf_dir: Path,
+    access_token: str,
+    model: str | None = None,
+    temperature: float | None = None,
+) -> Path:
     """
     Этап 4.
     Инкрементально наращиваем «смысл» инструкции по мере чтения страниц:
@@ -208,6 +222,8 @@ def stage4_build_incremental_context(pdf_dir: Path, access_token: str) -> Path:
                 question=question,
                 access_token=access_token,
                 sys_prompt=sys_prompt_incremental,
+                model=model,
+                temperature=temperature,
             )
         else:
             # Инкрементальное уточнение/расширение с учётом новой страницы

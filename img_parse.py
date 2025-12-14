@@ -37,6 +37,8 @@ GIGA_FILES_URL = os.getenv(
 # Модели для текста и мультимодальных запросов
 TEXT_MODEL = os.getenv("GIGA_TEXT_MODEL", "GigaChat-2-Pro")
 VISION_MODEL = os.getenv("GIGA_VISION_MODEL", "GigaChat-2-Pro")
+TEXT_TEMPERATURE = float(os.getenv("GIGA_TEXT_TEMPERATURE", "0.01"))
+VISION_TEMPERATURE = float(os.getenv("GIGA_VISION_TEMPERATURE", "0.01"))
 
 SYS_PROMPT = (
     "Ты опытный сотрудник кредитного отдела банка. "
@@ -165,6 +167,8 @@ def giga_free_answer(
     sys_prompt: str = "Ты банковский работник, ответь на заданный вопрос максимально лаконично",
     history=None,
     max_tokens: int | None = None,
+    model: str | None = None,
+    temperature: float | None = None,
 ) -> str:
     """
     Обычный текстовый запрос к GigaChat через REST (без картинок).
@@ -189,8 +193,8 @@ def giga_free_answer(
     messages.append({"role": "user", "content": question})
 
     payload = {
-        "model": TEXT_MODEL,
-        "temperature": 0.01,
+        "model": model or TEXT_MODEL,
+        "temperature": float(temperature) if temperature is not None else TEXT_TEMPERATURE,
         "messages": messages,
     }
     if isinstance(max_tokens, int):
@@ -226,7 +230,12 @@ def giga_free_answer(
 
 # ---------- Распознавание инструкции с изображения через REST ----------
 
-def ocr_instruction_via_rest(image_path: str, access_token: str) -> str:
+def ocr_instruction_via_rest(
+    image_path: str,
+    access_token: str,
+    model: str | None = None,
+    temperature: float | None = None,
+) -> str:
     """
     Отправляем в GigaChat-Pro изображение + промпт
     и получаем подробное текстовое описание инструкции.[web:67][web:69]
@@ -237,8 +246,8 @@ def ocr_instruction_via_rest(image_path: str, access_token: str) -> str:
     # 2. Строим payload строго по схеме из readme_gigachat_api.md:
     #    model + messages[ {role, content, attachments: [file_id]} ]
     payload = {
-        "model": VISION_MODEL,
-        "temperature": 0.01,
+        "model": model or VISION_MODEL,
+        "temperature": float(temperature) if temperature is not None else VISION_TEMPERATURE,
         "messages": [
             {
                 "role": "system",
