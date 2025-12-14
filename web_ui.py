@@ -372,6 +372,9 @@ PAGE_HTML = """
         </form>
       </div>
     </div>
+    {% if meta.get('last_error') %}
+      <p style="color:#b91c1c;"><strong>Ошибка:</strong> {{ meta['last_error'] }}</p>
+    {% endif %}
     {% if meta.get('last_op') %}
       <p class="muted">Последняя операция: {{ meta['last_op']['type'] }} (стр. {{ meta['last_op'].get('page','-') }}), delta total={{ meta['last_op']['token_delta']['total_tokens'] }}</p>
     {% endif %}
@@ -396,17 +399,29 @@ PAGE_HTML = """
   <div class="row">
     <div class="col card">
       <h3>OCR (по скриншоту)</h3>
-      <pre>{{ ocr_text or "" }}</pre>
+      {% if ocr_text %}
+        <pre>{{ ocr_text }}</pre>
+      {% else %}
+        <p class="muted">Нет OCR для этой страницы. Нажмите «Обработать страницу».</p>
+      {% endif %}
     </div>
     <div class="col card">
       <h3>Инструкция (merge)</h3>
-      <pre>{{ instruction or "" }}</pre>
+      {% if instruction %}
+        <pre>{{ instruction }}</pre>
+      {% else %}
+        <p class="muted">Нет инструкции для этой страницы. Нажмите «Обработать страницу».</p>
+      {% endif %}
     </div>
   </div>
 
   <div class="card">
     <h3>FAQ</h3>
-    <pre>{{ faq or "" }}</pre>
+    {% if faq %}
+      <pre>{{ faq }}</pre>
+    {% else %}
+      <p class="muted">FAQ ещё не сгенерирован. Нажмите «Сгенерировать FAQ» (после обработки страницы).</p>
+    {% endif %}
   </div>
 </body>
 </html>
@@ -523,13 +538,31 @@ def page_image(doc_id: str, page_num: int):
 
 @app.post("/doc/<doc_id>/page/<int:page_num>/process")
 def process_page(doc_id: str, page_num: int):
-    _process_page(doc_id, page_num)
+    try:
+        _process_page(doc_id, page_num)
+        meta = _load_meta(doc_id)
+        if meta.get("last_error"):
+            meta.pop("last_error", None)
+            _save_meta(doc_id, meta)
+    except Exception as e:
+        meta = _load_meta(doc_id)
+        meta["last_error"] = str(e)
+        _save_meta(doc_id, meta)
     return redirect(url_for("page", doc_id=doc_id, page_num=page_num))
 
 
 @app.post("/doc/<doc_id>/page/<int:page_num>/faq")
 def faq_page(doc_id: str, page_num: int):
-    _generate_faq_for_page(doc_id, page_num)
+    try:
+        _generate_faq_for_page(doc_id, page_num)
+        meta = _load_meta(doc_id)
+        if meta.get("last_error"):
+            meta.pop("last_error", None)
+            _save_meta(doc_id, meta)
+    except Exception as e:
+        meta = _load_meta(doc_id)
+        meta["last_error"] = str(e)
+        _save_meta(doc_id, meta)
     return redirect(url_for("page", doc_id=doc_id, page_num=page_num))
 
 
