@@ -3,6 +3,7 @@ import os
 import uuid
 from pathlib import Path
 from typing import Dict, Any, Tuple
+from io import BytesIO
 
 import fitz  # PyMuPDF
 from dotenv import load_dotenv
@@ -198,6 +199,51 @@ def _generate_faq_for_page(doc_id: str, page_num: int) -> None:
     _save_meta(doc_id, meta)
 
 
+def _build_instruction_export_md(doc_id: str) -> str:
+    """
+    Собираем итоговую инструкцию для выгрузки:
+    - если есть instructions_incremental.md — отдаём его;
+    - иначе — склеиваем instruction.txt по страницам с заголовками.
+    """
+    ddir = _doc_dir(doc_id)
+    inc = ddir / "instructions_incremental.md"
+    if inc.exists():
+        return inc.read_text(encoding="utf-8")
+
+    meta = _load_meta(doc_id)
+    pages = int(meta.get("pages", 0) or 0)
+    chunks = []
+    for p in range(1, pages + 1):
+        pd = _page_dir(doc_id, p)
+        ip = pd / "instruction.txt"
+        if not ip.exists():
+            continue
+        txt = ip.read_text(encoding="utf-8").strip()
+        if not txt:
+            continue
+        chunks.append(f"## Страница {p:03d}\n\n{txt}\n")
+    return "\n\n".join(chunks).strip() + "\n"
+
+
+def _build_faq_export_md(doc_id: str) -> str:
+    """
+    Склеиваем FAQ по всем страницам (page_XXX/faq.md).
+    """
+    meta = _load_meta(doc_id)
+    pages = int(meta.get("pages", 0) or 0)
+    chunks = []
+    for p in range(1, pages + 1):
+        pd = _page_dir(doc_id, p)
+        fp = pd / "faq.md"
+        if not fp.exists():
+            continue
+        txt = fp.read_text(encoding="utf-8").strip()
+        if not txt:
+            continue
+        chunks.append(txt)
+    return "\n\n".join(chunks).strip() + "\n"
+
+
 app = Flask(__name__)
 app.secret_key = os.getenv("WEB_SECRET_KEY", "dev-secret")
 
@@ -306,6 +352,10 @@ DOC_HTML = """
       <div><strong>Токены total:</strong> <code>{{ meta.get('tokens', {}).get('total_tokens', 0) }}</code></div>
     </div>
     <p class="muted"><strong>Каталог документа:</strong> <code>{{ meta.get('storage_dir','') }}</code></p>
+    <div class="row">
+      <a href="{{ url_for('download_instruction', doc_id=doc_id) }}">Скачать итоговую инструкцию (.md)</a>
+      <a href="{{ url_for('download_faq', doc_id=doc_id) }}">Скачать FAQ по всем страницам (.md)</a>
+    </div>
     {% if meta.get('last_op') %}
       <p class="muted">Последняя операция: {{ meta['last_op']['type'] }} (стр. {{ meta['last_op'].get('page','-') }}), delta total={{ meta['last_op']['token_delta']['total_tokens'] }}</p>
     {% endif %}
@@ -541,6 +591,36 @@ def page_image(doc_id: str, page_num: int):
     if not img.exists():
         abort(404)
     return send_file(img, mimetype="image/jpeg")
+
+
+@app.get("/doc/<doc_id>/download/instruction")
+def download_instruction(doc_id: str):
+    meta = _load_meta(doc_id)
+    if not meta:
+        abort(404)
+    md = _build_instruction_export_md(doc_id)
+    filename = f"{meta.get('pamphlet_name','document')}_instruction.md"
+    return send_file(
+        BytesIO(md.encode("utf-8")),
+        mimetype="text/markdown; charset=utf-8",
+        as_attachment=True,
+        download_name=filename,
+    )
+
+
+@app.get("/doc/<doc_id>/download/faq")
+def download_faq(doc_id: str):
+    meta = _load_meta(doc_id)
+    if not meta:
+        abort(404)
+    md = _build_faq_export_md(doc_id)
+    filename = f"{meta.get('pamphlet_name','document')}_faq.md"
+    return send_file(
+        BytesIO(md.encode("utf-8")),
+        mimetype="text/markdown; charset=utf-8",
+        as_attachment=True,
+        download_name=filename,
+    )
 
 
 @app.post("/doc/<doc_id>/page/<int:page_num>/process")
