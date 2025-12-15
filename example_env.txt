@@ -69,4 +69,15 @@ GIGA_VISION_TEMPERATURE=0.01
 # Секрет для Web UI (Flask)
 WEB_SECRET_KEY=change_me
 
+########################################
+# DOCX export (pandoc) — опционально
+########################################
+
+# Если pandoc не в PATH, укажите полный путь к бинарнику
+PANDOC_PATH=pandoc
+
+# Опционально: reference .docx для красивого стиля (шрифты/заголовки/таблицы)
+# Можно создать вручную в Word и передать сюда.
+PANDOC_REFERENCE_DOCX=/path/to/reference.docx
+
 

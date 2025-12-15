@@ -2,6 +2,7 @@ import json
 import os
 import uuid
 import threading
+import subprocess
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, Tuple
@@ -595,6 +596,59 @@ def _build_instruction_export_md(doc_id: str) -> str:
     return "\n\n".join(chunks).strip() + "\n"
 
 
+def _render_docx_from_markdown(md_text: str, title: str = "Instruction") -> bytes:
+    """
+    Конвертация Markdown → DOCX через pandoc (CLI).
+    Требует установленный pandoc в окружении (или указать путь через PANDOC_PATH).
+    """
+    pandoc = (os.getenv("PANDOC_PATH") or "pandoc").strip()
+    reference_docx = (os.getenv("PANDOC_REFERENCE_DOCX") or "").strip()
+
+    # Пишем во временные файлы внутри проекта документа, чтобы не зависеть от tmp-политик.
+    tmp_dir = APP_DATA_DIR / "_tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    tmp_id = str(uuid.uuid4())
+    md_path = tmp_dir / f"{tmp_id}.md"
+    docx_path = tmp_dir / f"{tmp_id}.docx"
+    md_path.write_text(md_text, encoding="utf-8")
+
+    cmd = [
+        pandoc,
+        str(md_path),
+        "-f",
+        "markdown",
+        "-t",
+        "docx",
+        "-o",
+        str(docx_path),
+        "--metadata",
+        f"title={title}",
+    ]
+    if reference_docx:
+        cmd.extend(["--reference-doc", reference_docx])
+
+    try:
+        subprocess.run(cmd, capture_output=True, text=True, check=True)
+    except FileNotFoundError as e:
+        raise RuntimeError(
+            "Pandoc не найден. Установите pandoc или задайте путь через PANDOC_PATH."
+        ) from e
+    except subprocess.CalledProcessError as e:
+        out = (e.stdout or "") + "\n" + (e.stderr or "")
+        raise RuntimeError(f"Ошибка pandoc при конвертации в docx:\n{out.strip()}") from e
+
+    data = docx_path.read_bytes()
+
+    # best-effort cleanup
+    try:
+        md_path.unlink(missing_ok=True)
+        docx_path.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+    return data
+
+
 def _build_faq_export_md(doc_id: str) -> str:
     """
     Склеиваем FAQ по всем страницам (page_XXX/faq.md).
@@ -792,6 +846,7 @@ DOC_HTML = """
     <p class="muted"><strong>Каталог документа:</strong> <code>{{ meta.get('storage_dir','') }}</code></p>
     <div class="row">
       <a href="{{ url_for('download_instruction', doc_id=doc_id) }}">Скачать итоговую инструкцию (.md)</a>
+      <a href="{{ url_for('download_instruction_docx', doc_id=doc_id) }}">Скачать итоговую инструкцию (.docx)</a>
       <a href="{{ url_for('download_faq_xlsx', doc_id=doc_id) }}">Скачать FAQ по всем страницам (.xlsx)</a>
     </div>
     <div class="row" style="margin-top: 10px;">
@@ -1190,6 +1245,33 @@ def download_instruction(doc_id: str):
     return send_file(
         BytesIO(md.encode("utf-8")),
         mimetype="text/markdown; charset=utf-8",
+        as_attachment=True,
+        download_name=filename,
+    )
+
+@app.get("/doc/<doc_id>/download/instruction.docx")
+def download_instruction_docx(doc_id: str):
+    meta = _load_meta(doc_id)
+    if not meta:
+        abort(404)
+    missing = _missing_pages(doc_id, "instruction")
+    if missing and request.args.get("force") != "1":
+        return render_template_string(
+            WARNING_HTML,
+            meta=meta,
+            missing=missing,
+            kind_label="instruction (.docx)",
+            force_url=url_for("download_instruction_docx", doc_id=doc_id, force=1),
+            back_url=url_for("doc", doc_id=doc_id),
+        )
+
+    md = _build_instruction_export_md(doc_id)
+    title = str(meta.get("pamphlet_name", "Instruction"))
+    docx_bytes = _render_docx_from_markdown(md, title=title)
+    filename = f"{meta.get('pamphlet_name','document')}_instruction.docx"
+    return send_file(
+        BytesIO(docx_bytes),
+        mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         as_attachment=True,
         download_name=filename,
     )
