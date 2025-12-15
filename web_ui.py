@@ -96,12 +96,12 @@ def _ensure_access_token() -> str:
     return token
 
 
-def _process_page(doc_id: str, page_num: int) -> None:
+def _process_page(doc_id: str, page_num: int, access_token: str | None = None) -> None:
     meta = _load_meta(doc_id)
     model = meta.get("model") or os.getenv("GIGA_TEXT_MODEL", "GigaChat-2-Pro")
     temperature = float(meta.get("temperature", 0.01))
 
-    access_token = _ensure_access_token()
+    access_token = access_token or _ensure_access_token()
     page_dir = _page_dir(doc_id, page_num)
     img_path = page_dir / "page.jpg"
     text_path = page_dir / "page.txt"
@@ -161,12 +161,12 @@ def _process_page(doc_id: str, page_num: int) -> None:
     _save_meta(doc_id, meta)
 
 
-def _generate_faq_for_page(doc_id: str, page_num: int) -> None:
+def _generate_faq_for_page(doc_id: str, page_num: int, access_token: str | None = None) -> None:
     meta = _load_meta(doc_id)
     model = meta.get("model") or os.getenv("GIGA_TEXT_MODEL", "GigaChat-2-Pro")
     temperature = float(meta.get("temperature", 0.01))
 
-    access_token = _ensure_access_token()
+    access_token = access_token or _ensure_access_token()
     page_dir = _page_dir(doc_id, page_num)
     instr_path = page_dir / "instruction.txt"
     if not instr_path.exists():
@@ -198,6 +198,42 @@ def _generate_faq_for_page(doc_id: str, page_num: int) -> None:
     _add_tokens(meta, delta)
     meta["last_op"] = {"type": "faq_page", "page": page_num, "token_delta": delta}
     _save_meta(doc_id, meta)
+
+def _process_all_pages(doc_id: str) -> tuple[int, int]:
+    """
+    Массовая обработка: OCR+Merge+контекст для всех страниц документа.
+    Возвращает (processed, total_pages).
+    """
+    meta = _load_meta(doc_id)
+    total = int(meta.get("pages", 0) or 0)
+    if total <= 0:
+        return 0, 0
+    token = _ensure_access_token()
+    processed = 0
+    for p in range(1, total + 1):
+        _process_page(doc_id, p, access_token=token)
+        processed += 1
+    return processed, total
+
+
+def _faq_all_pages(doc_id: str) -> tuple[int, int]:
+    """
+    Массовая генерация FAQ для всех страниц, где уже создан instruction.txt.
+    Возвращает (generated, total_pages).
+    """
+    meta = _load_meta(doc_id)
+    total = int(meta.get("pages", 0) or 0)
+    if total <= 0:
+        return 0, 0
+    token = _ensure_access_token()
+    generated = 0
+    for p in range(1, total + 1):
+        pd = _page_dir(doc_id, p)
+        if not (pd / "instruction.txt").exists():
+            continue
+        _generate_faq_for_page(doc_id, p, access_token=token)
+        generated += 1
+    return generated, total
 
 
 def _build_instruction_export_md(doc_id: str) -> str:
@@ -332,10 +368,10 @@ INDEX_HTML = """
   <h2>Smart PDF Parser — Web UI</h2>
 
   <div class="card">
-    <h3>Загрузить памятку (PDF)</h3>
+    <h3>Загрузить памятки (PDF)</h3>
     <form action="{{ url_for('upload') }}" method="post" enctype="multipart/form-data">
-      <label>PDF файл</label>
-      <input type="file" name="pdf" accept="application/pdf" required>
+      <label>PDF файлы</label>
+      <input type="file" name="pdfs" accept="application/pdf" multiple required>
 
       <div class="row">
         <div>
@@ -358,19 +394,27 @@ INDEX_HTML = """
   <div class="card">
     <h3>Документы</h3>
     {% if docs %}
-      <table>
-        <thead><tr><th>Памятка</th><th>Страниц</th><th>Токены (total)</th><th></th></tr></thead>
-        <tbody>
-        {% for d in docs %}
-          <tr>
-            <td><strong>{{ d['pamphlet_name'] }}</strong><div class="muted">{{ d['doc_id'] }}</div></td>
-            <td>{{ d.get('pages', '?') }}</td>
-            <td>{{ d.get('tokens', {}).get('total_tokens', 0) }}</td>
-            <td><a href="{{ url_for('doc', doc_id=d['doc_id']) }}">Открыть</a></td>
-          </tr>
-        {% endfor %}
-        </tbody>
-      </table>
+      <form action="{{ url_for('batch_process_docs') }}" method="post">
+        <div class="row" style="align-items:center; margin-bottom: 8px;">
+          <button type="submit" name="action" value="process">Обработать выбранные документы (все страницы)</button>
+          <button type="submit" name="action" value="faq">Сгенерировать FAQ для выбранных документов</button>
+          <span class="muted">Внимание: массовые операции могут выполняться долго.</span>
+        </div>
+        <table>
+          <thead><tr><th></th><th>Памятка</th><th>Страниц</th><th>Токены (total)</th><th></th></tr></thead>
+          <tbody>
+          {% for d in docs %}
+            <tr>
+              <td><input type="checkbox" name="doc_id" value="{{ d['doc_id'] }}"></td>
+              <td><strong>{{ d['pamphlet_name'] }}</strong><div class="muted">{{ d['doc_id'] }}</div></td>
+              <td>{{ d.get('pages', '?') }}</td>
+              <td>{{ d.get('tokens', {}).get('total_tokens', 0) }}</td>
+              <td><a href="{{ url_for('doc', doc_id=d['doc_id']) }}">Открыть</a></td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </form>
     {% else %}
       <p class="muted">Пока нет загруженных документов.</p>
     {% endif %}
@@ -415,6 +459,14 @@ DOC_HTML = """
     <div class="row">
       <a href="{{ url_for('download_instruction', doc_id=doc_id) }}">Скачать итоговую инструкцию (.md)</a>
       <a href="{{ url_for('download_faq_xlsx', doc_id=doc_id) }}">Скачать FAQ по всем страницам (.xlsx)</a>
+    </div>
+    <div class="row" style="margin-top: 10px;">
+      <form action="{{ url_for('doc_process_all', doc_id=doc_id) }}" method="post">
+        <button type="submit">Обработать все страницы</button>
+      </form>
+      <form action="{{ url_for('doc_faq_all', doc_id=doc_id) }}" method="post">
+        <button type="submit">FAQ по всем страницам</button>
+      </form>
     </div>
     {% if meta.get('last_op') %}
       <p class="muted">Последняя операция: {{ meta['last_op']['type'] }} (стр. {{ meta['last_op'].get('page','-') }}), delta total={{ meta['last_op']['token_delta']['total_tokens'] }}</p>
@@ -601,35 +653,43 @@ def index():
 
 @app.post("/upload")
 def upload():
-    f = request.files.get("pdf")
-    if not f or not f.filename.lower().endswith(".pdf"):
-        abort(400, "Нужен PDF файл.")
+    files = request.files.getlist("pdfs") or []
+    files = [f for f in files if f and f.filename]
+    if not files:
+        abort(400, "Нужны PDF файлы.")
 
     model = (request.form.get("model") or "GigaChat-2-Pro").strip()
     temperature = float(request.form.get("temperature") or 0.01)
 
-    doc_id = str(uuid.uuid4())
-    ddir = _doc_dir(doc_id)
-    ddir.mkdir(parents=True, exist_ok=True)
+    first_doc_id: str | None = None
+    for f in files:
+        if not f.filename.lower().endswith(".pdf"):
+            continue
+        doc_id = str(uuid.uuid4())
+        if first_doc_id is None:
+            first_doc_id = doc_id
 
-    pdf_path = ddir / "source.pdf"
-    f.save(pdf_path)
+        ddir = _doc_dir(doc_id)
+        ddir.mkdir(parents=True, exist_ok=True)
 
-    total_pages = _extract_pages(pdf_path, ddir, dpi=150)
+        pdf_path = ddir / "source.pdf"
+        f.save(pdf_path)
 
-    meta = {
-        "doc_id": doc_id,
-        "filename": f.filename,
-        "pamphlet_name": Path(f.filename).stem,
-        "pages": total_pages,
-        "model": model,
-        "temperature": temperature,
-        "tokens": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-        "storage_dir": str(ddir),
-    }
-    _save_meta(doc_id, meta)
+        total_pages = _extract_pages(pdf_path, ddir, dpi=150)
 
-    return redirect(url_for("doc", doc_id=doc_id))
+        meta = {
+            "doc_id": doc_id,
+            "filename": f.filename,
+            "pamphlet_name": Path(f.filename).stem,
+            "pages": total_pages,
+            "model": model,
+            "temperature": temperature,
+            "tokens": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            "storage_dir": str(ddir),
+        }
+        _save_meta(doc_id, meta)
+
+    return redirect(url_for("index") if first_doc_id is None else url_for("doc", doc_id=first_doc_id))
 
 
 @app.get("/doc/<doc_id>")
@@ -794,6 +854,72 @@ def faq_page(doc_id: str, page_num: int):
         meta["last_error"] = str(e)
         _save_meta(doc_id, meta)
     return redirect(url_for("page", doc_id=doc_id, page_num=page_num))
+
+@app.post("/doc/<doc_id>/process_all")
+def doc_process_all(doc_id: str):
+    try:
+        processed, total = _process_all_pages(doc_id)
+        meta = _load_meta(doc_id)
+        meta["last_op"] = {
+            "type": "process_all",
+            "page": "-",
+            "token_delta": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            "result": f"{processed}/{total}",
+        }
+        if meta.get("last_error"):
+            meta.pop("last_error", None)
+        _save_meta(doc_id, meta)
+    except Exception as e:
+        meta = _load_meta(doc_id)
+        meta["last_error"] = str(e)
+        _save_meta(doc_id, meta)
+    return redirect(url_for("doc", doc_id=doc_id))
+
+
+@app.post("/doc/<doc_id>/faq_all")
+def doc_faq_all(doc_id: str):
+    try:
+        generated, total = _faq_all_pages(doc_id)
+        meta = _load_meta(doc_id)
+        meta["last_op"] = {
+            "type": "faq_all",
+            "page": "-",
+            "token_delta": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            "result": f"{generated}/{total}",
+        }
+        if meta.get("last_error"):
+            meta.pop("last_error", None)
+        _save_meta(doc_id, meta)
+    except Exception as e:
+        meta = _load_meta(doc_id)
+        meta["last_error"] = str(e)
+        _save_meta(doc_id, meta)
+    return redirect(url_for("doc", doc_id=doc_id))
+
+
+@app.post("/batch/process_docs")
+def batch_process_docs():
+    doc_ids = request.form.getlist("doc_id")
+    action = request.form.get("action") or "process"
+    if not doc_ids:
+        return redirect(url_for("index"))
+
+    for doc_id in doc_ids:
+        try:
+            if action == "faq":
+                _faq_all_pages(doc_id)
+            else:
+                _process_all_pages(doc_id)
+            meta = _load_meta(doc_id)
+            if meta.get("last_error"):
+                meta.pop("last_error", None)
+                _save_meta(doc_id, meta)
+        except Exception as e:
+            meta = _load_meta(doc_id)
+            meta["last_error"] = str(e)
+            _save_meta(doc_id, meta)
+
+    return redirect(url_for("index"))
 
 
 def main():
