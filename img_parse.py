@@ -16,6 +16,16 @@ load_dotenv()
 GIGA_CHAT_AUTH_DATA = os.getenv("GIGA_ACCESS_KEY")
 GIGA_CHAT_SCOPE = os.getenv("GIGA_CHAT_SCOPE", "GIGACHAT_API_CORP")
 
+# ---------- mTLS / сертификаты (опционально) ----------
+# Если указаны сертификаты, то запросы выполняются с client-certificate (mTLS).
+# При наличии сертификатов мы СНАЧАЛА пробуем выполнить запрос без Bearer-токена,
+# и только при 401/403 (и наличии access_token) повторяем запрос с Authorization.
+GIGA_CLIENT_CERT = (os.getenv("GIGA_CLIENT_CERT") or "").strip()
+GIGA_CLIENT_KEY = (os.getenv("GIGA_CLIENT_KEY") or "").strip()
+GIGA_CA_BUNDLE = (os.getenv("GIGA_CA_BUNDLE") or "").strip()
+GIGA_TLS_VERIFY = (os.getenv("GIGA_TLS_VERIFY", "0") or "").strip().lower() in ("1", "true", "yes", "on")
+GIGA_FORCE_TOKEN_AUTH = (os.getenv("GIGA_FORCE_TOKEN_AUTH", "0") or "").strip().lower() in ("1", "true", "yes", "on")
+
 # эндпоинт NGW для получения токена
 NGW_URL = os.getenv(
     "GIGA_NGW_URL",
@@ -81,21 +91,110 @@ def generate_id() -> str:
     return str(uuid.uuid4())
 
 
+def _transport_kwargs() -> dict:
+    """
+    Общие kwargs для requests: verify + cert.
+    """
+    verify = GIGA_CA_BUNDLE if GIGA_CA_BUNDLE else (True if GIGA_TLS_VERIFY else False)
+    kwargs: dict = {"verify": verify}
+    if GIGA_CLIENT_CERT:
+        if GIGA_CLIENT_KEY:
+            kwargs["cert"] = (GIGA_CLIENT_CERT, GIGA_CLIENT_KEY)
+        else:
+            # поддержка "combined PEM" (cert+key в одном файле)
+            kwargs["cert"] = GIGA_CLIENT_CERT
+    return kwargs
+
+
+def _post_with_optional_token(
+    url: str,
+    headers_base: dict,
+    access_token: str | None,
+    *,
+    json_payload: dict | None = None,
+    data_payload: dict | None = None,
+    files_payload: dict | None = None,
+    timeout: int = 120,
+) -> requests.Response:
+    """
+    Логика приоритета:
+    - если указаны client-сертификаты: сначала пробуем запрос БЕЗ Authorization
+      (cert-auth), а если получили 401/403 и есть access_token — повторяем с Bearer.
+    - если сертификатов нет: работаем только по токену (Authorization обязателен).
+    """
+    has_cert = bool(GIGA_CLIENT_CERT)
+    headers_token = dict(headers_base)
+    if access_token:
+        headers_token["Authorization"] = f"Bearer {access_token}"
+
+    if not has_cert and not access_token:
+        raise RuntimeError(
+            "Не задан access_token, а client-сертификаты не настроены. "
+            "Либо настройте OAuth (GIGA_ACCESS_KEY), либо mTLS (GIGA_CLIENT_CERT/KEY)."
+        )
+
+    kwargs = _transport_kwargs()
+
+    # 1) cert-first
+    if has_cert and not GIGA_FORCE_TOKEN_AUTH:
+        resp = requests.post(
+            url,
+            headers=headers_base,
+            json=json_payload,
+            data=data_payload,
+            files=files_payload,
+            timeout=timeout,
+            **kwargs,
+        )
+        if resp.status_code in (401, 403) and access_token:
+            resp2 = requests.post(
+                url,
+                headers=headers_token,
+                json=json_payload,
+                data=data_payload,
+                files=files_payload,
+                timeout=timeout,
+                **kwargs,
+            )
+            return resp2
+        return resp
+
+    # 2) token-only
+    return requests.post(
+        url,
+        headers=headers_token,
+        json=json_payload,
+        data=data_payload,
+        files=files_payload,
+        timeout=timeout,
+        **kwargs,
+    )
+
+
 def get_creds() -> dict:
-    """Получаем access_token через NGW (как в твоём коде)."""
+    """
+    Получаем access_token через NGW (OAuth).
+    Если настроены сертификаты и OAuth-ключ не задан, возвращаем режим cert-auth без токена.
+    """
+    if GIGA_CLIENT_CERT and not GIGA_CHAT_AUTH_DATA:
+        return {"access_token": None, "auth_mode": "cert"}
+
     headers = {
-        "Authorization": f"Bearer {GIGA_CHAT_AUTH_DATA}",
         "RqUID": generate_id(),
         "Content-Type": "application/x-www-form-urlencoded",
     }
+    # OAuth ключ
+    if GIGA_CHAT_AUTH_DATA:
+        headers["Authorization"] = f"Bearer {GIGA_CHAT_AUTH_DATA}"
     data = {"scope": GIGA_CHAT_SCOPE}
 
-    r = requests.post(NGW_URL, headers=headers, data=data, verify=False)
+    r = requests.post(NGW_URL, headers=headers, data=data, timeout=60, **_transport_kwargs())
     json_response = json.loads(r.text)
+    json_response.setdefault("auth_mode", "token")
     return json_response
 
 
-def upload_image_to_files(path: str, access_token: str) -> str:
+def upload_image_to_files(path: str, access_token: str | None) -> str:
     """
     Загружаем изображение в хранилище GigaChat и получаем идентификатор файла,
     который потом передаётся в messages[*].attachments, как описано в доке.
@@ -110,25 +209,21 @@ def upload_image_to_files(path: str, access_token: str) -> str:
         # Библиотека и API в любом случае поймут JPEG/PNG, другие форматы лучше не использовать
         raise ValueError("Поддерживаются только изображения JPG/JPEG или PNG.")
 
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-    }
-
+    headers_base = {}
     with open(path, "rb") as f:
-        files = {
-            "file": (filename, f, mime_type),
-        }
+        content = f.read()
+        files = {"file": (filename, content, mime_type)}
         # Согласно спецификации FileUpload, дополнительно можно указать purpose=general
         data = {
             "purpose": "general",
         }
-        resp = requests.post(
+        resp = _post_with_optional_token(
             GIGA_FILES_URL,
-            headers=headers,
-            files=files,
-            data=data,
+            headers_base=headers_base,
+            access_token=access_token,
+            files_payload=files,
+            data_payload=data,
             timeout=120,
-            verify=False,
         )
 
     # Отдельно обрабатываем 400, чтобы увидеть текст ошибки от GigaChat и не падать трассировкой
@@ -163,7 +258,7 @@ def upload_image_to_files(path: str, access_token: str) -> str:
 
 def giga_free_answer(
     question: str,
-    access_token: str,
+    access_token: str | None,
     sys_prompt: str = "Ты банковский работник, ответь на заданный вопрос максимально лаконично",
     history=None,
     max_tokens: int | None = None,
@@ -201,16 +296,15 @@ def giga_free_answer(
         payload["max_tokens"] = max_tokens
 
     headers = {
-        "Authorization": f"Bearer {access_token}",
         "Content-Type": "application/json",
     }
 
-    resp = requests.post(
+    resp = _post_with_optional_token(
         GIGA_API_URL,
-        headers=headers,
-        json=payload,
+        headers_base=headers,
+        access_token=access_token,
+        json_payload=payload,
         timeout=120,
-        verify=False,
     )
 
     try:
@@ -232,7 +326,7 @@ def giga_free_answer(
 
 def ocr_instruction_via_rest(
     image_path: str,
-    access_token: str,
+    access_token: str | None,
     model: str | None = None,
     temperature: float | None = None,
 ) -> str:
@@ -271,16 +365,15 @@ def ocr_instruction_via_rest(
     }
 
     headers = {
-        "Authorization": f"Bearer {access_token}",
         "Content-Type": "application/json",
     }
 
-    resp = requests.post(
+    resp = _post_with_optional_token(
         GIGA_API_URL,
-        headers=headers,
-        json=payload,
+        headers_base=headers,
+        access_token=access_token,
+        json_payload=payload,
         timeout=120,
-        verify=False,
     )
 
     # Обработка ошибок HTTP (в т.ч. 413 и 400)

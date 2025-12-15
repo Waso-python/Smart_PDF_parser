@@ -229,7 +229,8 @@ def main() -> None:
     # Авторизация
     creds = get_creds()
     access_token = creds.get("access_token")
-    if not access_token:
+    # cert-mode: токена может не быть
+    if not access_token and creds.get("auth_mode") != "cert":
         raise RuntimeError(f"Токен не получен от NGW. Ответ: {creds}")
 
     # Парсинг страниц: сначала пробуем формат с SOURCE-тегами, иначе — по заголовкам

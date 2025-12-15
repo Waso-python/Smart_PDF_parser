@@ -250,9 +250,12 @@ def _page_dir(doc_id: str, page_num: int) -> Path:
 def _ensure_access_token() -> str:
     creds = get_creds()
     token = creds.get("access_token")
+    # cert-mode: токена может не быть, тогда работаем через mTLS (см. img_parse.py)
+    if not token and creds.get("auth_mode") == "cert":
+        return ""
     if not token:
         raise RuntimeError(f"Токен не получен от NGW. Ответ: {creds}")
-    return token
+    return str(token)
 
 
 def _process_page(
