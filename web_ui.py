@@ -1,6 +1,8 @@
 import json
 import os
 import uuid
+import threading
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, Tuple
 from io import BytesIO
@@ -15,6 +17,7 @@ from flask import (
     send_file,
     abort,
     render_template_string,
+    jsonify,
 )
 
 from img_parse import get_creds, get_token_stats, ocr_instruction_via_rest, giga_free_answer
@@ -28,11 +31,87 @@ load_dotenv()
 # По умолчанию складываем результаты Web UI в out/web/, чтобы было видно рядом с CLI-пайплайном.
 APP_DATA_DIR = Path(os.getenv("WEB_DATA_DIR", "out/web")).resolve()
 APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
+JOBS_DIR = (APP_DATA_DIR / "_jobs").resolve()
+JOBS_DIR.mkdir(parents=True, exist_ok=True)
+
+JOBS_LOCK = threading.Lock()
+JOB_THREADS: dict[str, threading.Thread] = {}
 
 
 def _doc_dir(doc_id: str) -> Path:
     return APP_DATA_DIR / doc_id
 
+
+def _job_path(job_id: str) -> Path:
+    return JOBS_DIR / f"{job_id}.json"
+
+
+def _job_load(job_id: str) -> Dict[str, Any]:
+    p = _job_path(job_id)
+    if not p.exists():
+        return {}
+    return json.loads(p.read_text(encoding="utf-8"))
+
+
+def _job_save(job: Dict[str, Any]) -> None:
+    job_id = str(job.get("job_id", ""))
+    if not job_id:
+        return
+    p = _job_path(job_id)
+    p.write_text(json.dumps(job, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _job_update(job_id: str, **fields: Any) -> Dict[str, Any]:
+    with JOBS_LOCK:
+        job = _job_load(job_id) or {"job_id": job_id}
+        job.update(fields)
+        _job_save(job)
+        return job
+
+
+def _new_job(job_type: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    job_id = str(uuid.uuid4())
+    job = {
+        "job_id": job_id,
+        "type": job_type,
+        "status": "running",  # running|done|error
+        "created_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "updated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "progress": {"done": 0, "total": 0},
+        "current": {"doc_id": None, "page": None},
+        "payload": payload,
+        "error": None,
+    }
+    _job_save(job)
+    return job
+
+
+def _job_set_progress(job_id: str, done: int, total: int, doc_id: str | None = None, page: int | None = None) -> None:
+    _job_update(
+        job_id,
+        updated_at=datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        progress={"done": int(done), "total": int(total)},
+        current={"doc_id": doc_id, "page": page},
+    )
+
+
+def _job_finish(job_id: str) -> None:
+    _job_update(
+        job_id,
+        status="done",
+        updated_at=datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        current={"doc_id": None, "page": None},
+    )
+
+
+def _job_fail(job_id: str, error: str) -> None:
+    _job_update(
+        job_id,
+        status="error",
+        error=str(error),
+        updated_at=datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        current={"doc_id": None, "page": None},
+    )
 
 def _meta_path(doc_id: str) -> Path:
     return _doc_dir(doc_id) / "meta.json"
@@ -234,6 +313,71 @@ def _faq_all_pages(doc_id: str) -> tuple[int, int]:
         _generate_faq_for_page(doc_id, p, access_token=token)
         generated += 1
     return generated, total
+
+def _job_worker_process_docs(job_id: str, doc_ids: list[str]) -> None:
+    """
+    Job: обработать все страницы для списка документов.
+    """
+    try:
+        token = _ensure_access_token()
+        # total = сумма страниц документов
+        total = 0
+        for did in doc_ids:
+            meta = _load_meta(did)
+            total += int(meta.get("pages", 0) or 0)
+        done = 0
+        _job_set_progress(job_id, done=done, total=total)
+
+        for did in doc_ids:
+            meta = _load_meta(did)
+            pages = int(meta.get("pages", 0) or 0)
+            for p in range(1, pages + 1):
+                _job_set_progress(job_id, done=done, total=total, doc_id=did, page=p)
+                _process_page(did, p, access_token=token)
+                done += 1
+
+        _job_set_progress(job_id, done=done, total=total)
+        _job_finish(job_id)
+    except Exception as e:
+        _job_fail(job_id, str(e))
+
+
+def _job_worker_faq_docs(job_id: str, doc_ids: list[str]) -> None:
+    """
+    Job: сгенерировать FAQ для всех страниц документов, где уже есть instruction.txt.
+    """
+    try:
+        token = _ensure_access_token()
+        # total = кол-во страниц с instruction.txt
+        total = 0
+        page_targets: list[tuple[str, int]] = []
+        for did in doc_ids:
+            meta = _load_meta(did)
+            pages = int(meta.get("pages", 0) or 0)
+            for p in range(1, pages + 1):
+                pd = _page_dir(did, p)
+                if (pd / "instruction.txt").exists():
+                    total += 1
+                    page_targets.append((did, p))
+        done = 0
+        _job_set_progress(job_id, done=done, total=total)
+
+        for did, p in page_targets:
+            _job_set_progress(job_id, done=done, total=total, doc_id=did, page=p)
+            _generate_faq_for_page(did, p, access_token=token)
+            done += 1
+
+        _job_set_progress(job_id, done=done, total=total)
+        _job_finish(job_id)
+    except Exception as e:
+        _job_fail(job_id, str(e))
+
+
+def _start_job_thread(job_id: str, target, *args) -> None:
+    t = threading.Thread(target=target, args=(job_id, *args), daemon=True)
+    with JOBS_LOCK:
+        JOB_THREADS[job_id] = t
+    t.start()
 
 
 def _build_instruction_export_md(doc_id: str) -> str:
@@ -494,6 +638,84 @@ DOC_HTML = """
       </tbody>
     </table>
   </div>
+</body>
+</html>
+"""
+
+JOB_HTML = """
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <title>Задание {{ job.get('job_id','') }} — Smart PDF Parser</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 24px; }
+    .card { border: 1px solid #e5e7eb; border-radius: 12px; padding: 16px; margin-bottom: 16px; }
+    .muted { color: #6b7280; }
+    .bar { width: 100%; height: 16px; background: #e5e7eb; border-radius: 10px; overflow: hidden; }
+    .fill { height: 16px; background: #111827; width: 0%; }
+    code { background: #f3f4f6; padding: 2px 6px; border-radius: 6px; }
+    a { color: #1d4ed8; text-decoration: none; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div style="display:flex; justify-content: space-between; gap: 16px; align-items:center;">
+      <div>
+        <h2 style="margin:0;">Задание</h2>
+        <div class="muted"><code>{{ job.get('job_id','') }}</code></div>
+      </div>
+      <div>
+        <a href="{{ url_for('index') }}">← на главную</a>
+      </div>
+    </div>
+
+    <p class="muted">
+      Тип: <code>{{ job.get('type','') }}</code> ·
+      Статус: <code id="st">{{ job.get('status','') }}</code>
+    </p>
+
+    <div class="bar"><div class="fill" id="fill"></div></div>
+    <p style="margin-top: 8px;">
+      <strong id="pct">0%</strong>
+      <span class="muted">(<span id="done">0</span>/<span id="total">0</span>)</span>
+    </p>
+    <p class="muted" id="cur"></p>
+    <p style="color:#b91c1c;" id="err"></p>
+
+    <p class="muted">
+      Обновляется автоматически. Если закрыть вкладку, прогресс всё равно сохранится, а страницу можно открыть снова по ссылке.
+    </p>
+  </div>
+
+  <script>
+    async function tick() {
+      const r = await fetch("{{ url_for('job_status', job_id=job.get('job_id','')) }}", { cache: "no-store" });
+      if (!r.ok) return;
+      const j = await r.json();
+      const done = (j.progress && j.progress.done) ? j.progress.done : 0;
+      const total = (j.progress && j.progress.total) ? j.progress.total : 0;
+      const pct = total > 0 ? Math.floor((done * 100) / total) : 0;
+
+      document.getElementById("st").textContent = j.status || "";
+      document.getElementById("done").textContent = done;
+      document.getElementById("total").textContent = total;
+      document.getElementById("pct").textContent = pct + "%";
+      document.getElementById("fill").style.width = pct + "%";
+
+      const cdoc = j.current && j.current.doc_id ? j.current.doc_id : "";
+      const cpage = j.current && j.current.page ? j.current.page : "";
+      document.getElementById("cur").textContent =
+        (cdoc ? ("Документ: " + cdoc + (cpage ? (", страница: " + String(cpage).padStart(3,'0')) : "")) : "");
+
+      document.getElementById("err").textContent = j.error || "";
+
+      if (j.status === "running") {
+        setTimeout(tick, 1000);
+      }
+    }
+    tick();
+  </script>
 </body>
 </html>
 """
@@ -855,46 +1077,35 @@ def faq_page(doc_id: str, page_num: int):
         _save_meta(doc_id, meta)
     return redirect(url_for("page", doc_id=doc_id, page_num=page_num))
 
+@app.get("/job/<job_id>")
+def job(job_id: str):
+    j = _job_load(job_id)
+    if not j:
+        abort(404)
+    return render_template_string(JOB_HTML, job=j)
+
+
+@app.get("/job/<job_id>/status")
+def job_status(job_id: str):
+    j = _job_load(job_id)
+    if not j:
+        abort(404)
+    return jsonify(j)
+
+
 @app.post("/doc/<doc_id>/process_all")
 def doc_process_all(doc_id: str):
-    try:
-        processed, total = _process_all_pages(doc_id)
-        meta = _load_meta(doc_id)
-        meta["last_op"] = {
-            "type": "process_all",
-            "page": "-",
-            "token_delta": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-            "result": f"{processed}/{total}",
-        }
-        if meta.get("last_error"):
-            meta.pop("last_error", None)
-        _save_meta(doc_id, meta)
-    except Exception as e:
-        meta = _load_meta(doc_id)
-        meta["last_error"] = str(e)
-        _save_meta(doc_id, meta)
-    return redirect(url_for("doc", doc_id=doc_id))
+    # запускаем в фоне и показываем прогресс
+    j = _new_job("process_docs", {"doc_ids": [doc_id]})
+    _start_job_thread(j["job_id"], _job_worker_process_docs, [doc_id])
+    return redirect(url_for("job", job_id=j["job_id"]))
 
 
 @app.post("/doc/<doc_id>/faq_all")
 def doc_faq_all(doc_id: str):
-    try:
-        generated, total = _faq_all_pages(doc_id)
-        meta = _load_meta(doc_id)
-        meta["last_op"] = {
-            "type": "faq_all",
-            "page": "-",
-            "token_delta": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-            "result": f"{generated}/{total}",
-        }
-        if meta.get("last_error"):
-            meta.pop("last_error", None)
-        _save_meta(doc_id, meta)
-    except Exception as e:
-        meta = _load_meta(doc_id)
-        meta["last_error"] = str(e)
-        _save_meta(doc_id, meta)
-    return redirect(url_for("doc", doc_id=doc_id))
+    j = _new_job("faq_docs", {"doc_ids": [doc_id]})
+    _start_job_thread(j["job_id"], _job_worker_faq_docs, [doc_id])
+    return redirect(url_for("job", job_id=j["job_id"]))
 
 
 @app.post("/batch/process_docs")
@@ -903,23 +1114,13 @@ def batch_process_docs():
     action = request.form.get("action") or "process"
     if not doc_ids:
         return redirect(url_for("index"))
-
-    for doc_id in doc_ids:
-        try:
-            if action == "faq":
-                _faq_all_pages(doc_id)
-            else:
-                _process_all_pages(doc_id)
-            meta = _load_meta(doc_id)
-            if meta.get("last_error"):
-                meta.pop("last_error", None)
-                _save_meta(doc_id, meta)
-        except Exception as e:
-            meta = _load_meta(doc_id)
-            meta["last_error"] = str(e)
-            _save_meta(doc_id, meta)
-
-    return redirect(url_for("index"))
+    if action == "faq":
+        j = _new_job("faq_docs", {"doc_ids": doc_ids})
+        _start_job_thread(j["job_id"], _job_worker_faq_docs, doc_ids)
+    else:
+        j = _new_job("process_docs", {"doc_ids": doc_ids})
+        _start_job_thread(j["job_id"], _job_worker_process_docs, doc_ids)
+    return redirect(url_for("job", job_id=j["job_id"]))
 
 
 def main():
