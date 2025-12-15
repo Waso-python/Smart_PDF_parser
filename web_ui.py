@@ -20,6 +20,7 @@ from flask import (
 from img_parse import get_creds, get_token_stats, ocr_instruction_via_rest, giga_free_answer
 from process_pamphlets import stage4_build_incremental_context
 from generate_faq import generate_faq_for_pages, _build_doc_context
+from openpyxl import Workbook
 
 
 load_dotenv()
@@ -243,6 +244,48 @@ def _build_faq_export_md(doc_id: str) -> str:
         chunks.append(txt)
     return "\n\n".join(chunks).strip() + "\n"
 
+def _parse_faq_md_to_rows(md: str) -> list[dict]:
+    """
+    Поддерживаем формат:
+      ВОПРОС: ...
+      ОТВЕТ/ИНСТРУКЦИЯ: ...
+      [SOURCE - "..."]
+    """
+    import re
+
+    block_re = re.compile(
+        r"ВОПРОС:\s*(?P<q>.*?)(?:\r?\n)+"
+        r"(?:ОТВЕТ|ИНСТРУКЦИЯ):\s*(?P<a>.*?)(?:\r?\n)+"
+        r"\[SOURCE\s*-\s*\"(?P<s>.*?)\"\]\s*",
+        re.DOTALL | re.IGNORECASE,
+    )
+    rows = []
+    for m in block_re.finditer(md.strip()):
+        rows.append(
+            {
+                "question": m.group("q").strip(),
+                "answer": m.group("a").strip(),
+                "source": m.group("s").strip(),
+            }
+        )
+    return rows
+
+
+def _rows_to_xlsx_bytes(rows: list[dict]) -> bytes:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "FAQ"
+    ws.append(["Вопрос", "Ответ", "Источник"])
+    for r in rows:
+        ws.append([r.get("question", ""), r.get("answer", ""), r.get("source", "")])
+    ws.column_dimensions["A"].width = 60
+    ws.column_dimensions["B"].width = 90
+    ws.column_dimensions["C"].width = 40
+
+    bio = BytesIO()
+    wb.save(bio)
+    return bio.getvalue()
+
 
 def _missing_pages(doc_id: str, kind: str) -> list[int]:
     """
@@ -371,7 +414,7 @@ DOC_HTML = """
     <p class="muted"><strong>Каталог документа:</strong> <code>{{ meta.get('storage_dir','') }}</code></p>
     <div class="row">
       <a href="{{ url_for('download_instruction', doc_id=doc_id) }}">Скачать итоговую инструкцию (.md)</a>
-      <a href="{{ url_for('download_faq', doc_id=doc_id) }}">Скачать FAQ по всем страницам (.md)</a>
+      <a href="{{ url_for('download_faq_xlsx', doc_id=doc_id) }}">Скачать FAQ по всем страницам (.xlsx)</a>
     </div>
     {% if meta.get('last_op') %}
       <p class="muted">Последняя операция: {{ meta['last_op']['type'] }} (стр. {{ meta['last_op'].get('page','-') }}), delta total={{ meta['last_op']['token_delta']['total_tokens'] }}</p>
@@ -696,6 +739,32 @@ def download_faq(doc_id: str):
         download_name=filename,
     )
 
+@app.get("/doc/<doc_id>/download/faq.xlsx")
+def download_faq_xlsx(doc_id: str):
+    meta = _load_meta(doc_id)
+    if not meta:
+        abort(404)
+    missing = _missing_pages(doc_id, "faq")
+    if missing and request.args.get("force") != "1":
+        return render_template_string(
+            WARNING_HTML,
+            meta=meta,
+            missing=missing,
+            kind_label="faq.md",
+            force_url=url_for("download_faq_xlsx", doc_id=doc_id, force=1),
+            back_url=url_for("doc", doc_id=doc_id),
+        )
+
+    md = _build_faq_export_md(doc_id)
+    rows = _parse_faq_md_to_rows(md)
+    xlsx_bytes = _rows_to_xlsx_bytes(rows)
+    filename = f"{meta.get('pamphlet_name','document')}_faq.xlsx"
+    return send_file(
+        BytesIO(xlsx_bytes),
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        as_attachment=True,
+        download_name=filename,
+    )
 
 @app.post("/doc/<doc_id>/page/<int:page_num>/process")
 def process_page(doc_id: str, page_num: int):

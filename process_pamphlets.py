@@ -12,6 +12,8 @@ except ImportError as e:
     ) from e
 
 from img_parse import get_creds, giga_free_answer, ocr_instruction_via_rest, get_token_stats
+from generate_faq import generate_faq_rows_for_pages, _build_doc_context
+from openpyxl import Workbook
 
 
 def stage1_extract_pages(pdf_path: Path, out_root: Path) -> List[Dict]:
@@ -329,6 +331,42 @@ def run_pipeline(pdf_dir: Path, out_root: Path) -> None:
         # Этап 4: инкрементальное накопление смысла по страницам
         incremental_path = stage4_build_incremental_context(pdf_out_dir, access_token)
         print(f"Этап 4: итоговый документ с накопленным контекстом: {incremental_path}")
+
+        # Этап 5 (опционально): FAQ в Excel по всем страницам
+        if os.getenv("GENERATE_FAQ_XLSX", "0") == "1":
+            print("Этап 5: генерация FAQ (Excel) по всем страницам...")
+            doc_text = incremental_path.read_text(encoding="utf-8") if incremental_path.exists() else ""
+            doc_ctx = _build_doc_context(doc_text, max_chars=12000)
+
+            pages_for_faq = []
+            for info in page_infos:
+                page_num = info["page_num"]
+                instr_path = info["dir"] / "instruction.txt"
+                if instr_path.exists():
+                    pages_for_faq.append((page_num, instr_path.read_text(encoding="utf-8")))
+
+            rows = generate_faq_rows_for_pages(
+                pages=pages_for_faq,
+                full_doc_context=doc_ctx,
+                access_token=access_token,
+                pamphlet_name=pdf_path.stem,
+                output_tokens=int(os.getenv("FAQ_OUTPUT_TOKENS", "10000")),
+            )
+
+            # XLSX
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "FAQ"
+            ws.append(["Вопрос", "Ответ", "Источник"])
+            for r in rows:
+                ws.append([r.get("question", ""), r.get("answer", ""), r.get("source", "")])
+            ws.column_dimensions["A"].width = 60
+            ws.column_dimensions["B"].width = 90
+            ws.column_dimensions["C"].width = 40
+
+            faq_xlsx_path = pdf_out_dir / f"{pdf_path.stem}_faq.xlsx"
+            wb.save(faq_xlsx_path)
+            print(f"Этап 5: FAQ сохранён: {faq_xlsx_path}")
 
     # После обработки всех PDF выводим суммарное потребление токенов
     stats = get_token_stats()

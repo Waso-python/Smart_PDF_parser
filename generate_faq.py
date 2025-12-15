@@ -4,10 +4,17 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 from img_parse import get_creds, giga_free_answer, get_token_stats
+from openpyxl import Workbook
 
 
 PAGE_HEADER_RE = re.compile(r"^##\s*Страница\s+(\d+)\s*$", re.MULTILINE)
 SOURCE_TAG_RE = re.compile(r"\[SOURCE:\s*page\s*(\d{1,3})\s*\]", re.IGNORECASE)
+FAQ_BLOCK_RE = re.compile(
+    r"ВОПРОС:\s*(?P<q>.*?)(?:\r?\n)+"
+    r"(?:ОТВЕТ|ИНСТРУКЦИЯ):\s*(?P<a>.*?)(?:\r?\n)+"
+    r"\[SOURCE\s*-\s*\"(?P<s>.*?)\"\]\s*",
+    re.DOTALL | re.IGNORECASE,
+)
 
 
 def _split_by_page_headers(md: str) -> List[Tuple[int, str]]:
@@ -59,6 +66,38 @@ def _build_doc_context(md: str, max_chars: int = 8000) -> str:
     return md[:max_chars] + "\n\n[...ОБРЕЗАНО...]\n"
 
 
+def _parse_faq_blocks(text: str) -> List[Dict[str, str]]:
+    """
+    Парсим ответы модели в блоках:
+      ВОПРОС: ...
+      ОТВЕТ/ИНСТРУКЦИЯ: ...
+      [SOURCE - "..."]
+    """
+    items: List[Dict[str, str]] = []
+    for m in FAQ_BLOCK_RE.finditer(text.strip()):
+        q = m.group("q").strip()
+        a = m.group("a").strip()
+        s = m.group("s").strip()
+        if q and a and s:
+            items.append({"question": q, "answer": a, "source": s})
+    return items
+
+
+def _rows_to_xlsx(rows: List[Dict[str, str]], out_path: Path) -> None:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "FAQ"
+    ws.append(["Вопрос", "Ответ", "Источник"])
+    for r in rows:
+        ws.append([r.get("question", ""), r.get("answer", ""), r.get("source", "")])
+
+    # Немного авто-ширины (ограниченно)
+    for col, width in (("A", 60), ("B", 90), ("C", 40)):
+        ws.column_dimensions[col].width = width
+
+    wb.save(out_path)
+
+
 def generate_faq_for_pages(
     pages: List[Tuple[int, str]],
     full_doc_context: str,
@@ -105,7 +144,7 @@ def generate_faq_for_pages(
             "- используй профессиональный сленг, соответствующий банковским АС;\n\n"
             "Формат ВЫВОДА (строго, повторить блок 3–5 раз):\n\n"
             "ВОПРОС: <текст вопроса>\n\n"
-            "ИНСТРУКЦИЯ: <подробный ответ>\n\n"
+            "ОТВЕТ: <подробный ответ>\n\n"
             f'[SOURCE - "{pamphlet_name} - {page_num:03d}"]\n\n'
             "Правила формата:\n"
             "- после строки [SOURCE - \"...\"] сразу начинается следующий блок или конец ответа;\n"
@@ -123,6 +162,28 @@ def generate_faq_for_pages(
         out_chunks.append(f"## FAQ — Страница {page_num:03d}\n\n{faq}\n")
 
     return "\n\n".join(out_chunks).strip() + "\n"
+
+
+def generate_faq_rows_for_pages(
+    pages: List[Tuple[int, str]],
+    full_doc_context: str,
+    access_token: str,
+    pamphlet_name: str,
+    output_tokens: int = 10000,
+) -> List[Dict[str, str]]:
+    """
+    Генерируем FAQ и возвращаем список строк для Excel:
+      {"question": "...", "answer": "...", "source": "..."}
+    """
+    md = generate_faq_for_pages(
+        pages=pages,
+        full_doc_context=full_doc_context,
+        access_token=access_token,
+        pamphlet_name=pamphlet_name,
+        output_tokens=output_tokens,
+    )
+    rows = _parse_faq_blocks(md)
+    return rows
 
 
 def main() -> None:
@@ -143,7 +204,7 @@ def main() -> None:
         "--out",
         type=str,
         default="",
-        help="Путь к выходному файлу. По умолчанию создаётся рядом: <input>_faq.md",
+        help="Путь к выходному файлу. По умолчанию создаётся рядом: <input>_faq.xlsx",
     )
     parser.add_argument(
         "--pamphlet-name",
@@ -196,7 +257,7 @@ def main() -> None:
         parent_name = in_path.parent.name
         pamphlet_name = parent_name if parent_name else in_path.stem
 
-    faq_md = generate_faq_for_pages(
+    rows = generate_faq_rows_for_pages(
         pages=pages,
         full_doc_context=doc_context,
         access_token=access_token,
@@ -204,9 +265,9 @@ def main() -> None:
         output_tokens=args.output_tokens,
     )
 
-    out_path = Path(args.out) if args.out else in_path.with_name(f"{in_path.stem}_faq.md")
-    out_path.write_text(faq_md, encoding="utf-8")
-    print(f"FAQ сохранён: {out_path}")
+    out_path = Path(args.out) if args.out else in_path.with_name(f"{in_path.stem}_faq.xlsx")
+    _rows_to_xlsx(rows, out_path)
+    print(f"FAQ (Excel) сохранён: {out_path}")
 
     stats = get_token_stats()
     print(

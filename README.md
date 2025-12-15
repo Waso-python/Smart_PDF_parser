@@ -102,6 +102,13 @@ python generate_faq.py --md out/<pdf>/instructions_incremental.md
 python generate_faq.py --md out/<pdf>/instructions_merged.md --pamphlet-name "Моя памятка"
 ```
 
+FAQ по умолчанию выгружается в **Excel (.xlsx)** с колонками:
+
+- **Вопрос**
+- **Ответ**
+- **Источник**
+
+
 ### Web интерфейс
 
 Запуск:
@@ -111,5 +118,10 @@ python web_ui.py
 ```
 
 По умолчанию интерфейс поднимется на `127.0.0.1:8000` (настраивается через переменные `WEB_HOST` и `WEB_PORT` в `.env`).
+
+В интерфейсе документа доступна выгрузка:
+
+- итоговой инструкции (`.md`);
+- FAQ по всем страницам (`.xlsx`).
 
 
