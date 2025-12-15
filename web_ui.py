@@ -89,6 +89,79 @@ def _new_job(job_type: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     return job
 
 
+def _iter_jobs() -> list[Dict[str, Any]]:
+    jobs: list[Dict[str, Any]] = []
+    if not JOBS_DIR.exists():
+        return jobs
+    for p in JOBS_DIR.iterdir():
+        if not p.is_file() or p.suffix.lower() != ".json":
+            continue
+        try:
+            jobs.append(json.loads(p.read_text(encoding="utf-8")))
+        except Exception:
+            continue
+    return jobs
+
+
+def _job_doc_ids(job: Dict[str, Any]) -> set[str]:
+    payload = job.get("payload") or {}
+    ids = payload.get("doc_ids") or []
+    if isinstance(ids, list):
+        return {str(x) for x in ids if x}
+    return set()
+
+
+def _find_running_job_for_doc(doc_id: str) -> str | None:
+    """
+    Если документ уже участвует в выполняющемся задании — вернём job_id.
+    Блокируем любые новые задания для этого документа, чтобы не плодить дубли.
+    """
+    did = str(doc_id)
+    for job in _iter_jobs():
+        if job.get("status") != "running":
+            continue
+        if did in _job_doc_ids(job):
+            jid = job.get("job_id")
+            if jid:
+                return str(jid)
+    return None
+
+
+JOB_CONFLICT_HTML = """
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <title>Задание уже выполняется</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 24px; }
+    .card { border: 1px solid #e5e7eb; border-radius: 12px; padding: 16px; margin-bottom: 16px; }
+    .warn { color: #b45309; font-weight: 700; }
+    code { background: #f3f4f6; padding: 2px 6px; border-radius: 6px; }
+    a { color: #1d4ed8; text-decoration: none; }
+    ul { margin: 8px 0 0 18px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2 class="warn">Для некоторых документов уже есть выполняющееся задание</h2>
+    <p>Новые задания для этих документов не создаются, чтобы избежать дублей.</p>
+    <ul>
+      {% for c in conflicts %}
+        <li>
+          Документ: <code>{{ c['doc_id'] }}</code>
+          → <a href="{{ url_for('job', job_id=c['job_id']) }}">Открыть задание</a>
+        </li>
+      {% endfor %}
+    </ul>
+  </div>
+  <div class="card">
+    <a href="{{ back_url }}">← Вернуться</a>
+  </div>
+</body>
+</html>
+"""
+
 def _job_set_progress(job_id: str, done: int, total: int, doc_id: str | None = None, page: int | None = None) -> None:
     _job_update(
         job_id,
@@ -1099,6 +1172,9 @@ def job_status(job_id: str):
 @app.post("/doc/<doc_id>/process_all")
 def doc_process_all(doc_id: str):
     # запускаем в фоне и показываем прогресс
+    existing = _find_running_job_for_doc(doc_id)
+    if existing:
+        return redirect(url_for("job", job_id=existing))
     j = _new_job("process_docs", {"doc_ids": [doc_id]})
     _start_job_thread(j["job_id"], _job_worker_process_docs, [doc_id])
     return redirect(url_for("job", job_id=j["job_id"]))
@@ -1106,6 +1182,9 @@ def doc_process_all(doc_id: str):
 
 @app.post("/doc/<doc_id>/faq_all")
 def doc_faq_all(doc_id: str):
+    existing = _find_running_job_for_doc(doc_id)
+    if existing:
+        return redirect(url_for("job", job_id=existing))
     j = _new_job("faq_docs", {"doc_ids": [doc_id]})
     _start_job_thread(j["job_id"], _job_worker_faq_docs, [doc_id])
     return redirect(url_for("job", job_id=j["job_id"]))
@@ -1117,6 +1196,18 @@ def batch_process_docs():
     action = request.form.get("action") or "process"
     if not doc_ids:
         return redirect(url_for("index"))
+
+    conflicts = []
+    for did in doc_ids:
+        existing = _find_running_job_for_doc(did)
+        if existing:
+            conflicts.append({"doc_id": did, "job_id": existing})
+    if conflicts:
+        return render_template_string(
+            JOB_CONFLICT_HTML,
+            conflicts=conflicts,
+            back_url=url_for("index"),
+        )
     if action == "faq":
         j = _new_job("faq_docs", {"doc_ids": doc_ids})
         _start_job_thread(j["job_id"], _job_worker_faq_docs, doc_ids)
