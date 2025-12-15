@@ -58,6 +58,9 @@ def _job_save(job: Dict[str, Any]) -> None:
     if not job_id:
         return
     p = _job_path(job_id)
+    # На другой машине/в контейнере каталог может отсутствовать (или быть удалён во время работы).
+    # Гарантируем наличие папки перед записью.
+    p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(job, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
