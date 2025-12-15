@@ -222,7 +222,7 @@ def _add_tokens(meta: Dict[str, Any], delta: Dict[str, int]) -> None:
     meta["tokens"] = cur
 
 
-def _extract_pages(pdf_path: Path, out_dir: Path, dpi: int = 150) -> int:
+def _extract_pages(pdf_path: Path, out_dir: Path, dpi: int = 150, skip_existing: bool = True) -> int:
     doc = fitz.open(pdf_path)
     total = doc.page_count
     for i in range(total):
@@ -231,11 +231,15 @@ def _extract_pages(pdf_path: Path, out_dir: Path, dpi: int = 150) -> int:
         page_dir = out_dir / f"page_{page_num:03d}"
         page_dir.mkdir(parents=True, exist_ok=True)
 
-        text = page.get_text("text")
-        (page_dir / "page.txt").write_text(text, encoding="utf-8")
+        txt_path = page_dir / "page.txt"
+        if not (skip_existing and txt_path.exists()):
+            text = page.get_text("text")
+            txt_path.write_text(text, encoding="utf-8")
 
-        pix = page.get_pixmap(dpi=dpi)
-        pix.save(str(page_dir / "page.jpg"))
+        img_path = page_dir / "page.jpg"
+        if not (skip_existing and img_path.exists()):
+            pix = page.get_pixmap(dpi=dpi)
+            pix.save(str(img_path))
     return total
 
 
@@ -251,7 +255,12 @@ def _ensure_access_token() -> str:
     return token
 
 
-def _process_page(doc_id: str, page_num: int, access_token: str | None = None) -> None:
+def _process_page(
+    doc_id: str,
+    page_num: int,
+    access_token: str | None = None,
+    force: bool = False,
+) -> None:
     meta = _load_meta(doc_id)
     model = meta.get("model") or os.getenv("GIGA_TEXT_MODEL", "GigaChat-2-Pro")
     temperature = float(meta.get("temperature", 0.01))
@@ -263,16 +272,25 @@ def _process_page(doc_id: str, page_num: int, access_token: str | None = None) -
     if not img_path.exists() or not text_path.exists():
         raise FileNotFoundError("Не найдены файлы страницы (page.jpg/page.txt).")
 
+    instr_path = page_dir / "instruction.txt"
+    if instr_path.exists() and not force:
+        # Уже обработано — ничего не пересоздаём.
+        return
+
     before = get_token_stats()
 
     # OCR по изображению
-    ocr_text = ocr_instruction_via_rest(
-        str(img_path),
-        access_token,
-        model=model,
-        temperature=temperature,
-    )
-    (page_dir / "ocr.txt").write_text(ocr_text, encoding="utf-8")
+    ocr_path = page_dir / "ocr.txt"
+    if ocr_path.exists() and not force:
+        ocr_text = ocr_path.read_text(encoding="utf-8")
+    else:
+        ocr_text = ocr_instruction_via_rest(
+            str(img_path),
+            access_token,
+            model=model,
+            temperature=temperature,
+        )
+        ocr_path.write_text(ocr_text, encoding="utf-8")
 
     # Merge: текстовый слой + OCR → instruction.txt
     text_layer = text_path.read_text(encoding="utf-8")
@@ -299,7 +317,7 @@ def _process_page(doc_id: str, page_num: int, access_token: str | None = None) -
         model=model,
         temperature=temperature,
     )
-    (page_dir / "instruction.txt").write_text(instruction, encoding="utf-8")
+    instr_path.write_text(instruction, encoding="utf-8")
 
     # Обновляем инкрементальный контекст (только по тексту instruction.txt)
     stage4_build_incremental_context(
@@ -327,6 +345,11 @@ def _generate_faq_for_page(doc_id: str, page_num: int, access_token: str | None 
     if not instr_path.exists():
         raise FileNotFoundError("Сначала выполните обработку страницы (instruction.txt не найден).")
 
+    faq_path = page_dir / "faq.md"
+    if faq_path.exists():
+        # Уже создано — не пересоздаём.
+        return
+
     # Контекст документа: берём инкрементальный или merged, если есть
     inc_path = _doc_dir(doc_id) / "instructions_incremental.md"
     if inc_path.exists():
@@ -348,7 +371,7 @@ def _generate_faq_for_page(doc_id: str, page_num: int, access_token: str | None 
     after = get_token_stats()
     delta = _token_delta(before, after)
 
-    (page_dir / "faq.md").write_text(faq_md, encoding="utf-8")
+    faq_path.write_text(faq_md, encoding="utf-8")
 
     _add_tokens(meta, delta)
     meta["last_op"] = {"type": "faq_page", "page": page_num, "token_delta": delta}
@@ -364,11 +387,16 @@ def _process_all_pages(doc_id: str) -> tuple[int, int]:
     if total <= 0:
         return 0, 0
     token = _ensure_access_token()
-    processed = 0
+    targets = []
     for p in range(1, total + 1):
+        pd = _page_dir(doc_id, p)
+        if not (pd / "instruction.txt").exists():
+            targets.append(p)
+    processed = 0
+    for p in targets:
         _process_page(doc_id, p, access_token=token)
         processed += 1
-    return processed, total
+    return processed, len(targets)
 
 
 def _faq_all_pages(doc_id: str) -> tuple[int, int]:
@@ -381,14 +409,19 @@ def _faq_all_pages(doc_id: str) -> tuple[int, int]:
     if total <= 0:
         return 0, 0
     token = _ensure_access_token()
-    generated = 0
+    targets = []
     for p in range(1, total + 1):
         pd = _page_dir(doc_id, p)
         if not (pd / "instruction.txt").exists():
             continue
+        if (pd / "faq.md").exists():
+            continue
+        targets.append(p)
+    generated = 0
+    for p in targets:
         _generate_faq_for_page(doc_id, p, access_token=token)
         generated += 1
-    return generated, total
+    return generated, len(targets)
 
 def _job_worker_process_docs(job_id: str, doc_ids: list[str]) -> None:
     """
@@ -396,21 +429,25 @@ def _job_worker_process_docs(job_id: str, doc_ids: list[str]) -> None:
     """
     try:
         token = _ensure_access_token()
-        # total = сумма страниц документов
-        total = 0
-        for did in doc_ids:
-            meta = _load_meta(did)
-            total += int(meta.get("pages", 0) or 0)
-        done = 0
-        _job_set_progress(job_id, done=done, total=total)
-
+        # total = только страницы, которые ещё не обработаны (нет instruction.txt)
+        targets: list[tuple[str, int]] = []
         for did in doc_ids:
             meta = _load_meta(did)
             pages = int(meta.get("pages", 0) or 0)
             for p in range(1, pages + 1):
-                _job_set_progress(job_id, done=done, total=total, doc_id=did, page=p)
-                _process_page(did, p, access_token=token)
-                done += 1
+                pd = _page_dir(did, p)
+                if (pd / "instruction.txt").exists():
+                    continue
+                targets.append((did, p))
+
+        total = len(targets)
+        done = 0
+        _job_set_progress(job_id, done=done, total=total)
+
+        for did, p in targets:
+            _job_set_progress(job_id, done=done, total=total, doc_id=did, page=p)
+            _process_page(did, p, access_token=token)
+            done += 1
 
         _job_set_progress(job_id, done=done, total=total)
         _job_finish(job_id)
@@ -424,17 +461,20 @@ def _job_worker_faq_docs(job_id: str, doc_ids: list[str]) -> None:
     """
     try:
         token = _ensure_access_token()
-        # total = кол-во страниц с instruction.txt
-        total = 0
+        # total = только страницы, где есть instruction.txt, но нет faq.md
         page_targets: list[tuple[str, int]] = []
         for did in doc_ids:
             meta = _load_meta(did)
             pages = int(meta.get("pages", 0) or 0)
             for p in range(1, pages + 1):
                 pd = _page_dir(did, p)
-                if (pd / "instruction.txt").exists():
-                    total += 1
-                    page_targets.append((did, p))
+                if not (pd / "instruction.txt").exists():
+                    continue
+                if (pd / "faq.md").exists():
+                    continue
+                page_targets.append((did, p))
+
+        total = len(page_targets)
         done = 0
         _job_set_progress(job_id, done=done, total=total)
 
