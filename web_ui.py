@@ -334,6 +334,45 @@ def _process_page(
     _save_meta(doc_id, meta)
 
 
+def _ocr_only_page(
+    doc_id: str,
+    page_num: int,
+    access_token: str | None = None,
+    force: bool = False,
+) -> None:
+    """
+    Простая обработка: только OCR по page.jpg → ocr.txt
+    Без merge и без incremental.
+    """
+    meta = _load_meta(doc_id)
+    model = meta.get("model") or os.getenv("GIGA_TEXT_MODEL", "GigaChat-2-Pro")
+    temperature = float(meta.get("temperature", 0.01))
+
+    access_token = access_token or _ensure_access_token()
+    page_dir = _page_dir(doc_id, page_num)
+    img_path = page_dir / "page.jpg"
+    if not img_path.exists():
+        raise FileNotFoundError("Не найден файл страницы (page.jpg).")
+
+    ocr_path = page_dir / "ocr.txt"
+    if ocr_path.exists() and not force:
+        return
+
+    before = get_token_stats()
+    ocr_text = ocr_instruction_via_rest(
+        str(img_path),
+        access_token,
+        model=model,
+        temperature=temperature,
+    )
+    ocr_path.write_text(ocr_text, encoding="utf-8")
+    after = get_token_stats()
+    delta = _token_delta(before, after)
+    _add_tokens(meta, delta)
+    meta["last_op"] = {"type": "ocr_only_page", "page": page_num, "token_delta": delta}
+    _save_meta(doc_id, meta)
+
+
 def _generate_faq_for_page(doc_id: str, page_num: int, access_token: str | None = None) -> None:
     meta = _load_meta(doc_id)
     model = meta.get("model") or os.getenv("GIGA_TEXT_MODEL", "GigaChat-2-Pro")
@@ -447,6 +486,37 @@ def _job_worker_process_docs(job_id: str, doc_ids: list[str]) -> None:
         for did, p in targets:
             _job_set_progress(job_id, done=done, total=total, doc_id=did, page=p)
             _process_page(did, p, access_token=token)
+            done += 1
+
+        _job_set_progress(job_id, done=done, total=total)
+        _job_finish(job_id)
+    except Exception as e:
+        _job_fail(job_id, str(e))
+
+
+def _job_worker_ocr_only_docs(job_id: str, doc_ids: list[str]) -> None:
+    """
+    Job: простой OCR по всем страницам документов (где ещё нет ocr.txt).
+    """
+    try:
+        token = _ensure_access_token()
+        targets: list[tuple[str, int]] = []
+        for did in doc_ids:
+            meta = _load_meta(did)
+            pages = int(meta.get("pages", 0) or 0)
+            for p in range(1, pages + 1):
+                pd = _page_dir(did, p)
+                if (pd / "ocr.txt").exists():
+                    continue
+                targets.append((did, p))
+
+        total = len(targets)
+        done = 0
+        _job_set_progress(job_id, done=done, total=total)
+
+        for did, p in targets:
+            _job_set_progress(job_id, done=done, total=total, doc_id=did, page=p)
+            _ocr_only_page(did, p, access_token=token)
             done += 1
 
         _job_set_progress(job_id, done=done, total=total)
@@ -657,6 +727,7 @@ INDEX_HTML = """
       <form action="{{ url_for('batch_process_docs') }}" method="post">
         <div class="row" style="align-items:center; margin-bottom: 8px;">
           <button type="submit" name="action" value="process">Обработать выбранные документы (все страницы)</button>
+          <button type="submit" name="action" value="ocr_only">OCR только (выбранные документы)</button>
           <button type="submit" name="action" value="faq">Сгенерировать FAQ для выбранных документов</button>
           <span class="muted">Внимание: массовые операции могут выполняться долго.</span>
         </div>
@@ -724,6 +795,9 @@ DOC_HTML = """
       <form action="{{ url_for('doc_process_all', doc_id=doc_id) }}" method="post">
         <button type="submit">Обработать все страницы</button>
       </form>
+      <form action="{{ url_for('doc_ocr_only_all', doc_id=doc_id) }}" method="post">
+        <button type="submit">OCR только (все страницы)</button>
+      </form>
       <form action="{{ url_for('doc_faq_all', doc_id=doc_id) }}" method="post">
         <button type="submit">FAQ по всем страницам</button>
       </form>
@@ -745,6 +819,7 @@ DOC_HTML = """
             {% set pd = page_dirs[p] %}
             {{ "img" if pd['has_img'] else "-" }} /
             {{ "txt" if pd['has_txt'] else "-" }} /
+            {{ "ocr" if pd['has_ocr'] else "-" }} /
             {{ "instr" if pd['has_instr'] else "-" }} /
             {{ "faq" if pd['has_faq'] else "-" }}
           </td>
@@ -903,6 +978,9 @@ PAGE_HTML = """
     <div class="bar">
       <div class="muted">Модель: {{ meta.get('model') }} | t={{ meta.get('temperature') }} | tokens total={{ meta.get('tokens', {}).get('total_tokens', 0) }}</div>
       <div class="row">
+        <form action="{{ url_for('ocr_only_page', doc_id=doc_id, page_num=page_num) }}" method="post">
+          <button type="submit" {% if not has_img %}disabled{% endif %}>OCR только</button>
+        </form>
         <form action="{{ url_for('process_page', doc_id=doc_id, page_num=page_num) }}" method="post">
           <button type="submit">Обработать страницу (OCR+Merge + контекст)</button>
         </form>
@@ -1042,6 +1120,7 @@ def doc(doc_id: str):
         page_dirs[p] = {
             "has_img": (pd / "page.jpg").exists(),
             "has_txt": (pd / "page.txt").exists(),
+            "has_ocr": (pd / "ocr.txt").exists(),
             "has_instr": (pd / "instruction.txt").exists(),
             "has_faq": (pd / "faq.md").exists(),
         }
@@ -1179,6 +1258,21 @@ def process_page(doc_id: str, page_num: int):
     return redirect(url_for("page", doc_id=doc_id, page_num=page_num))
 
 
+@app.post("/doc/<doc_id>/page/<int:page_num>/ocr")
+def ocr_only_page(doc_id: str, page_num: int):
+    try:
+        _ocr_only_page(doc_id, page_num)
+        meta = _load_meta(doc_id)
+        if meta.get("last_error"):
+            meta.pop("last_error", None)
+            _save_meta(doc_id, meta)
+    except Exception as e:
+        meta = _load_meta(doc_id)
+        meta["last_error"] = str(e)
+        _save_meta(doc_id, meta)
+    return redirect(url_for("page", doc_id=doc_id, page_num=page_num))
+
+
 @app.post("/doc/<doc_id>/page/<int:page_num>/faq")
 def faq_page(doc_id: str, page_num: int):
     try:
@@ -1220,6 +1314,16 @@ def doc_process_all(doc_id: str):
     return redirect(url_for("job", job_id=j["job_id"]))
 
 
+@app.post("/doc/<doc_id>/ocr_only_all")
+def doc_ocr_only_all(doc_id: str):
+    existing = _find_running_job_for_doc(doc_id)
+    if existing:
+        return redirect(url_for("job", job_id=existing))
+    j = _new_job("ocr_only_docs", {"doc_ids": [doc_id]})
+    _start_job_thread(j["job_id"], _job_worker_ocr_only_docs, [doc_id])
+    return redirect(url_for("job", job_id=j["job_id"]))
+
+
 @app.post("/doc/<doc_id>/faq_all")
 def doc_faq_all(doc_id: str):
     existing = _find_running_job_for_doc(doc_id)
@@ -1251,6 +1355,9 @@ def batch_process_docs():
     if action == "faq":
         j = _new_job("faq_docs", {"doc_ids": doc_ids})
         _start_job_thread(j["job_id"], _job_worker_faq_docs, doc_ids)
+    elif action == "ocr_only":
+        j = _new_job("ocr_only_docs", {"doc_ids": doc_ids})
+        _start_job_thread(j["job_id"], _job_worker_ocr_only_docs, doc_ids)
     else:
         j = _new_job("process_docs", {"doc_ids": doc_ids})
         _start_job_thread(j["job_id"], _job_worker_process_docs, doc_ids)
