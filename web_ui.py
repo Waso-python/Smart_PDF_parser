@@ -84,6 +84,7 @@ def _new_job(job_type: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         "progress": {"done": 0, "total": 0},
         "current": {"doc_id": None, "page": None},
         "payload": payload,
+        "message": None,
         "error": None,
     }
     _job_save(job)
@@ -617,6 +618,18 @@ def _job_worker_faq_docs(job_id: str, doc_ids: list[str]) -> None:
         done = 0
         _job_set_progress(job_id, done=done, total=total)
 
+        if total == 0:
+            _job_update(
+                job_id,
+                message=(
+                    "Нечего делать: нет страниц для генерации FAQ. "
+                    "Причины: (1) FAQ уже сгенерирован (есть page_XXX/faq.md), "
+                    "(2) нет instruction.txt, по которому строится FAQ."
+                ),
+            )
+            _job_finish(job_id)
+            return
+
         for did, p in page_targets:
             _job_set_progress(job_id, done=done, total=total, doc_id=did, page=p)
             _generate_faq_for_page(did, p, access_token=token)
@@ -999,6 +1012,7 @@ JOB_HTML = """
       <span class="muted">(<span id="done">0</span>/<span id="total">0</span>)</span>
     </p>
     <p class="muted" id="cur"></p>
+    <p class="muted" id="msg"></p>
     <p style="color:#b91c1c;" id="err"></p>
 
     <p class="muted">
@@ -1026,6 +1040,7 @@ JOB_HTML = """
       document.getElementById("cur").textContent =
         (cdoc ? ("Документ: " + cdoc + (cpage ? (", страница: " + String(cpage).padStart(3,'0')) : "")) : "");
 
+      document.getElementById("msg").textContent = j.message || "";
       document.getElementById("err").textContent = j.error || "";
 
       if (j.status === "running") {
