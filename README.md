@@ -57,6 +57,12 @@ pip install -r requirements.txt
 python process_pamphlets.py --pdf-dir pdfs --out-dir out
 ```
 
+Режим **только OCR** (без merge и без incremental), где `instruction.txt` на каждой странице формируется из OCR и включает строку источника `[SOURCE - "Памятка - NNN"]`:
+
+```bash
+python process_pamphlets.py --pdf-dir pdfs --out-dir out --mode ocr_only
+```
+
 Аргументы:
 
 - `--pdf-dir` — каталог с исходными PDF (по умолчанию `pdfs`);

@@ -16,6 +16,36 @@ from generate_faq import generate_faq_rows_for_pages, _build_doc_context
 from openpyxl import Workbook
 
 
+def _source_line(pamphlet_name: str, page_num: int) -> str:
+    safe_name = (pamphlet_name or "document").replace('"', "'").strip()
+    return f'[SOURCE - "{safe_name} - {page_num:03d}"]'
+
+
+def stage2_build_instruction_for_page_ocr_only(
+    image_path: Path,
+    access_token: str | None,
+    pamphlet_name: str,
+    page_num: int,
+    model: str | None = None,
+    temperature: float | None = None,
+) -> str:
+    """
+    Режим OCR-only:
+      - один мультимодальный вызов (ocr_instruction_via_rest)
+      - instruction.txt = OCR-текст + строка источника
+    Без merge и без incremental.
+    """
+    ocr_text = ocr_instruction_via_rest(
+        str(image_path),
+        access_token,
+        model=model,
+        temperature=temperature,
+    ).strip()
+    src = _source_line(pamphlet_name, page_num)
+    if ocr_text:
+        return f"{ocr_text}\n\n{src}\n"
+    return f"{src}\n"
+
 def stage1_extract_pages(pdf_path: Path, out_root: Path) -> List[Dict]:
     """
     Этап 1.
@@ -273,7 +303,7 @@ def stage4_build_incremental_context(
     return incremental_path
 
 
-def run_pipeline(pdf_dir: Path, out_root: Path) -> None:
+def run_pipeline(pdf_dir: Path, out_root: Path, mode: str = "full") -> None:
     """
     Запускает все три этапа пайплайна для всех PDF в указанном каталоге.
     """
@@ -312,11 +342,19 @@ def run_pipeline(pdf_dir: Path, out_root: Path) -> None:
 
             print(f"Этап 2: страница {page_num} ({page_dir})")
             try:
-                instruction = stage2_build_instruction_for_page(
-                    text_path=text_path,
-                    image_path=image_path,
-                    access_token=access_token,
-                )
+                if mode == "ocr_only":
+                    instruction = stage2_build_instruction_for_page_ocr_only(
+                        image_path=image_path,
+                        access_token=access_token,
+                        pamphlet_name=pdf_path.stem,
+                        page_num=page_num,
+                    )
+                else:
+                    instruction = stage2_build_instruction_for_page(
+                        text_path=text_path,
+                        image_path=image_path,
+                        access_token=access_token,
+                    )
             except ValueError as e:
                 # Ошибки размера/загрузки/валидации обрабатываем мягко, но логируем
                 print(f"  Ошибка при обработке страницы {page_num}: {e}")
@@ -331,8 +369,11 @@ def run_pipeline(pdf_dir: Path, out_root: Path) -> None:
         print(f"Этап 3: итоговый документ (страницы по отдельности): {merged_path}")
 
         # Этап 4: инкрементальное накопление смысла по страницам
-        incremental_path = stage4_build_incremental_context(pdf_out_dir, access_token)
-        print(f"Этап 4: итоговый документ с накопленным контекстом: {incremental_path}")
+        if mode != "ocr_only":
+            incremental_path = stage4_build_incremental_context(pdf_out_dir, access_token)
+            print(f"Этап 4: итоговый документ с накопленным контекстом: {incremental_path}")
+        else:
+            print("Этап 4: пропущен (режим ocr_only — без incremental).")
 
         # Этап 5 (опционально): FAQ в Excel по всем страницам
         if os.getenv("GENERATE_FAQ_XLSX", "0") == "1":
@@ -385,7 +426,7 @@ def main() -> None:
         description=(
             "Пайплайн обработки памяток по работе в АС:\n"
             "1) Разбиение PDF на страницы (текст + скриншот); "
-            "2) Обработка скриншотов через GigaChat и объединение с текстовым слоем; "
+            "2) Обработка страниц через GigaChat (full: OCR+merge / ocr_only: только OCR); "
             "3) Склейка итоговых инструкций в один документ."
         )
     )
@@ -403,9 +444,16 @@ def main() -> None:
         help="Каталог, куда складывать результаты пайплайна.",
 		default="out",
     )
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="full",
+        choices=["full", "ocr_only"],
+        help="Режим обработки: full = OCR+merge+incremental; ocr_only = только OCR (instruction.txt из OCR + SOURCE, без incremental).",
+    )
 
     args = parser.parse_args()
-    run_pipeline(pdf_dir=Path(args.pdf_dir), out_root=Path(args.out_dir))
+    run_pipeline(pdf_dir=Path(args.pdf_dir), out_root=Path(args.out_dir), mode=args.mode)
 
 
 if __name__ == "__main__":
