@@ -191,6 +191,53 @@ def _render_docx_from_markdown_file(md_path: Path, docx_path: Path, *, title: st
         raise RuntimeError(f"Ошибка pandoc при конвертации в docx:\n{out.strip()}") from e
 
 
+def merge_instructions_to_docx(doc_dir: str | Path, output_md: str | Path | None = None, output_docx: str | Path | None = None) -> Tuple[Path, Path]:
+    """
+    Склеивает все instruction.txt из page_XXX директорий документа в один markdown файл,
+    а затем конвертирует его в docx через pandoc.
+
+    Args:
+        doc_dir: Путь к каталогу документа (например, out/web/<uuid>/)
+        output_md: Путь для сохранения объединённого markdown. По умолчанию: <doc_dir>/instructions_merged.md
+        output_docx: Путь для сохранения docx. По умолчанию: <doc_dir>/instructions_merged.docx
+
+    Returns:
+        Tuple[Path, Path]: (путь к md файлу, путь к docx файлу)
+    """
+    doc_dir = Path(doc_dir)
+    if not doc_dir.exists():
+        raise FileNotFoundError(f"Каталог документа не найден: {doc_dir}")
+
+    # Загружаем страницы
+    pages = _load_pages_from_doc_dir(doc_dir)
+    if not pages:
+        raise ValueError(f"Не найдено инструкций в {doc_dir}. Ожидаются page_XXX/instruction.txt")
+
+    pages = sorted(pages, key=lambda x: x[0])
+
+    # Формируем markdown с заголовками страниц
+    md_parts: List[str] = []
+    for page_num, content in pages:
+        md_parts.append(f"## Страница {page_num:03d}\n\n{content}")
+
+    merged_md = "\n\n".join(md_parts) + "\n"
+
+    # Определяем пути вывода
+    md_path = Path(output_md) if output_md else (doc_dir / "instructions_merged.md")
+    docx_path = Path(output_docx) if output_docx else (doc_dir / "instructions_merged.docx")
+
+    # Сохраняем markdown
+    md_path.write_text(merged_md, encoding="utf-8")
+    print(f"Объединённый markdown сохранён: {md_path}")
+
+    # Конвертируем в docx через pandoc
+    title = doc_dir.name if doc_dir.name else "Instructions"
+    _render_docx_from_markdown_file(md_path, docx_path, title=title)
+    print(f"DOCX сохранён: {docx_path}")
+
+    return md_path, docx_path
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
@@ -236,11 +283,31 @@ def main() -> None:
         default=12000,
         help="Лимит max_tokens для одного ответа модели. По умолчанию 12000.",
     )
+    parser.add_argument(
+        "--merge-only",
+        action="store_true",
+        help="Только склеить instruction.txt без обработки LLM. Сохраняет instructions_merged.md и .docx.",
+    )
+    parser.add_argument(
+        "--out-merged-md",
+        type=str,
+        default="",
+        help="Путь для объединённого markdown (при --merge-only). По умолчанию: <doc>/instructions_merged.md",
+    )
 
     args = parser.parse_args()
     in_path = Path(args.input)
     if not in_path.exists():
         raise FileNotFoundError(f"Не найдено: {in_path}")
+
+    # Режим простой склейки (без LLM)
+    if args.merge_only:
+        if not in_path.is_dir():
+            raise ValueError("Для --merge-only нужен каталог документа, а не файл.")
+        out_md = Path(args.out_merged_md) if args.out_merged_md else None
+        out_docx = Path(args.out_docx) if args.out_docx else None
+        merge_instructions_to_docx(in_path, output_md=out_md, output_docx=out_docx)
+        return
 
     # Авторизация
     creds = get_creds()
