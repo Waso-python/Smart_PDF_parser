@@ -1106,8 +1106,23 @@ PAGE_HTML = """
     pre { white-space: pre-wrap; background: #0b1020; color: #e5e7eb; padding: 12px; border-radius: 10px; overflow:auto; }
     .muted { color: #6b7280; }
     button { padding: 10px 14px; border: 0; border-radius: 10px; background: #111827; color: #fff; cursor: pointer; }
+    button.secondary { background: #6b7280; }
+    button.success { background: #059669; }
+    button.small { padding: 6px 10px; font-size: 13px; }
     a { color: #1d4ed8; text-decoration: none; }
     .bar { display:flex; justify-content: space-between; align-items:center; gap: 12px; flex-wrap: wrap; }
+    .edit-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+    .edit-header h3 { margin: 0; }
+    .edit-buttons { display: flex; gap: 8px; }
+    textarea.edit-area {
+      width: 100%; min-height: 300px; padding: 12px; border-radius: 10px;
+      border: 2px solid #3b82f6; background: #0b1020; color: #e5e7eb;
+      font-family: monospace; font-size: 14px; resize: vertical;
+    }
+    .status-msg { font-size: 13px; margin-left: 8px; }
+    .status-msg.ok { color: #059669; }
+    .status-msg.err { color: #dc2626; }
+    .hidden { display: none; }
   </style>
 </head>
 <body>
@@ -1154,38 +1169,192 @@ PAGE_HTML = """
     </div>
 
     <div class="col card">
-      <h3>Текстовый слой (PDF)</h3>
-      <pre>{{ page_text or "" }}</pre>
+      <div class="edit-header">
+        <h3>Текстовый слой (PDF)</h3>
+        <div class="edit-buttons">
+          <button class="small secondary" onclick="toggleEdit('page_text')">Редактировать</button>
+        </div>
+      </div>
+      <div id="page_text-view">
+        <pre>{{ page_text or "" }}</pre>
+      </div>
+      <div id="page_text-edit" class="hidden">
+        <textarea class="edit-area" id="page_text-textarea">{{ page_text or "" }}</textarea>
+        <div style="margin-top: 8px; display: flex; align-items: center;">
+          <button class="small success" onclick="saveField('page_text')">Сохранить</button>
+          <button class="small secondary" onclick="cancelEdit('page_text')" style="margin-left: 8px;">Отмена</button>
+          <span id="page_text-status" class="status-msg"></span>
+        </div>
+      </div>
     </div>
   </div>
 
   <div class="row">
     <div class="col card">
-      <h3>OCR (по скриншоту)</h3>
-      {% if ocr_text %}
-        <pre>{{ ocr_text }}</pre>
-      {% else %}
-        <p class="muted">Нет OCR для этой страницы. Нажмите «Обработать страницу».</p>
-      {% endif %}
+      <div class="edit-header">
+        <h3>OCR (по скриншоту)</h3>
+        <div class="edit-buttons">
+          {% if ocr_text %}
+            <button class="small secondary" onclick="toggleEdit('ocr')">Редактировать</button>
+          {% endif %}
+        </div>
+      </div>
+      <div id="ocr-view">
+        {% if ocr_text %}
+          <pre>{{ ocr_text }}</pre>
+        {% else %}
+          <p class="muted">Нет OCR для этой страницы. Нажмите «Обработать страницу».</p>
+        {% endif %}
+      </div>
+      <div id="ocr-edit" class="hidden">
+        <textarea class="edit-area" id="ocr-textarea">{{ ocr_text or "" }}</textarea>
+        <div style="margin-top: 8px; display: flex; align-items: center;">
+          <button class="small success" onclick="saveField('ocr')">Сохранить</button>
+          <button class="small secondary" onclick="cancelEdit('ocr')" style="margin-left: 8px;">Отмена</button>
+          <span id="ocr-status" class="status-msg"></span>
+        </div>
+      </div>
     </div>
+
     <div class="col card">
-      <h3>Инструкция (merge)</h3>
-      {% if instruction %}
-        <pre>{{ instruction }}</pre>
-      {% else %}
-        <p class="muted">Нет инструкции для этой страницы. Нажмите «Обработать страницу».</p>
-      {% endif %}
+      <div class="edit-header">
+        <h3>Инструкция (merge)</h3>
+        <div class="edit-buttons">
+          {% if instruction %}
+            <button class="small secondary" onclick="toggleEdit('instruction')">Редактировать</button>
+          {% endif %}
+        </div>
+      </div>
+      <div id="instruction-view">
+        {% if instruction %}
+          <pre>{{ instruction }}</pre>
+        {% else %}
+          <p class="muted">Нет инструкции для этой страницы. Нажмите «Обработать страницу».</p>
+        {% endif %}
+      </div>
+      <div id="instruction-edit" class="hidden">
+        <textarea class="edit-area" id="instruction-textarea">{{ instruction or "" }}</textarea>
+        <div style="margin-top: 8px; display: flex; align-items: center;">
+          <button class="small success" onclick="saveField('instruction')">Сохранить</button>
+          <button class="small secondary" onclick="cancelEdit('instruction')" style="margin-left: 8px;">Отмена</button>
+          <span id="instruction-status" class="status-msg"></span>
+        </div>
+      </div>
     </div>
   </div>
 
   <div class="card">
-    <h3>FAQ</h3>
-    {% if faq %}
-      <pre>{{ faq }}</pre>
-    {% else %}
-      <p class="muted">FAQ ещё не сгенерирован. Нажмите «Сгенерировать FAQ» (после обработки страницы).</p>
-    {% endif %}
+    <div class="edit-header">
+      <h3>FAQ</h3>
+      <div class="edit-buttons">
+        {% if faq %}
+          <button class="small secondary" onclick="toggleEdit('faq')">Редактировать</button>
+        {% endif %}
+      </div>
+    </div>
+    <div id="faq-view">
+      {% if faq %}
+        <pre>{{ faq }}</pre>
+      {% else %}
+        <p class="muted">FAQ ещё не сгенерирован. Нажмите «Сгенерировать FAQ» (после обработки страницы).</p>
+      {% endif %}
+    </div>
+    <div id="faq-edit" class="hidden">
+      <textarea class="edit-area" id="faq-textarea" style="min-height: 400px;">{{ faq or "" }}</textarea>
+      <div style="margin-top: 8px; display: flex; align-items: center;">
+        <button class="small success" onclick="saveField('faq')">Сохранить</button>
+        <button class="small secondary" onclick="cancelEdit('faq')" style="margin-left: 8px;">Отмена</button>
+        <span id="faq-status" class="status-msg"></span>
+      </div>
+    </div>
   </div>
+
+  <script>
+    const originalValues = {
+      page_text: {{ page_text|tojson }},
+      ocr: {{ ocr_text|tojson }},
+      instruction: {{ instruction|tojson }},
+      faq: {{ faq|tojson }}
+    };
+
+    function toggleEdit(field) {
+      const viewEl = document.getElementById(field + '-view');
+      const editEl = document.getElementById(field + '-edit');
+      const textarea = document.getElementById(field + '-textarea');
+      const statusEl = document.getElementById(field + '-status');
+
+      if (editEl.classList.contains('hidden')) {
+        viewEl.classList.add('hidden');
+        editEl.classList.remove('hidden');
+        textarea.focus();
+        statusEl.textContent = '';
+      } else {
+        cancelEdit(field);
+      }
+    }
+
+    function cancelEdit(field) {
+      const viewEl = document.getElementById(field + '-view');
+      const editEl = document.getElementById(field + '-edit');
+      const textarea = document.getElementById(field + '-textarea');
+      const statusEl = document.getElementById(field + '-status');
+
+      textarea.value = originalValues[field] || '';
+      editEl.classList.add('hidden');
+      viewEl.classList.remove('hidden');
+      statusEl.textContent = '';
+    }
+
+    async function saveField(field) {
+      const textarea = document.getElementById(field + '-textarea');
+      const statusEl = document.getElementById(field + '-status');
+      const newValue = textarea.value;
+
+      statusEl.textContent = 'Сохранение...';
+      statusEl.className = 'status-msg';
+
+      try {
+        const resp = await fetch("{{ url_for('save_page_field', doc_id=doc_id, page_num=page_num) }}", {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ field: field, content: newValue })
+        });
+
+        const data = await resp.json();
+
+        if (data.ok) {
+          statusEl.textContent = 'Сохранено!';
+          statusEl.className = 'status-msg ok';
+          originalValues[field] = newValue;
+
+          // Обновляем pre в view
+          const viewEl = document.getElementById(field + '-view');
+          const preEl = viewEl.querySelector('pre');
+          if (preEl) {
+            preEl.textContent = newValue;
+          } else if (newValue) {
+            viewEl.innerHTML = '<pre>' + escapeHtml(newValue) + '</pre>';
+          }
+
+          setTimeout(() => {
+            cancelEdit(field);
+          }, 800);
+        } else {
+          statusEl.textContent = 'Ошибка: ' + (data.error || 'неизвестная');
+          statusEl.className = 'status-msg err';
+        }
+      } catch (e) {
+        statusEl.textContent = 'Ошибка сети: ' + e.message;
+        statusEl.className = 'status-msg err';
+      }
+    }
+
+    function escapeHtml(text) {
+      const div = document.createElement('div');
+      div.textContent = text;
+      return div.innerHTML;
+    }
+  </script>
 </body>
 </html>
 """
@@ -1474,6 +1643,45 @@ def faq_page(doc_id: str, page_num: int):
         meta["last_error"] = str(e)
         _save_meta(doc_id, meta)
     return redirect(url_for("page", doc_id=doc_id, page_num=page_num))
+
+
+@app.post("/doc/<doc_id>/page/<int:page_num>/save")
+def save_page_field(doc_id: str, page_num: int):
+    """
+    API для сохранения отредактированных текстовых фрагментов страницы.
+    Принимает JSON: { "field": "ocr"|"instruction"|"faq"|"page_text", "content": "..." }
+    """
+    meta = _load_meta(doc_id)
+    if not meta:
+        return jsonify({"ok": False, "error": "Документ не найден"}), 404
+
+    pd = _page_dir(doc_id, page_num)
+    if not pd.exists():
+        return jsonify({"ok": False, "error": "Страница не найдена"}), 404
+
+    data = request.get_json(silent=True) or {}
+    field = data.get("field", "").strip()
+    content = data.get("content", "")
+
+    # Маппинг полей на файлы
+    field_to_file = {
+        "ocr": "ocr.txt",
+        "instruction": "instruction.txt",
+        "faq": "faq.md",
+        "page_text": "page.txt",
+    }
+
+    if field not in field_to_file:
+        return jsonify({"ok": False, "error": f"Неизвестное поле: {field}"}), 400
+
+    filename = field_to_file[field]
+    filepath = pd / filename
+
+    try:
+        filepath.write_text(content, encoding="utf-8")
+        return jsonify({"ok": True, "field": field, "saved_to": str(filepath)})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 @app.get("/job/<job_id>")
 def job(job_id: str):
