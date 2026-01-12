@@ -413,6 +413,62 @@ def _instruction_from_ocr_only_page(
         instr_path.write_text(f"{src}\n", encoding="utf-8")
 
 
+def _instruction_from_text_layer_page(
+    doc_id: str,
+    page_num: int,
+    force: bool = False,
+) -> None:
+    """
+    Инструкция по странице ТОЛЬКО из текстового слоя PDF (без OCR):
+      - instruction.txt = page.txt + SOURCE
+    Полезно, когда текстовый слой качественный и OCR не нужен.
+    """
+    meta = _load_meta(doc_id)
+    page_dir = _page_dir(doc_id, page_num)
+    instr_path = page_dir / "instruction.txt"
+    if instr_path.exists() and not force:
+        return
+
+    text_path = page_dir / "page.txt"
+    text_layer = text_path.read_text(encoding="utf-8").strip() if text_path.exists() else ""
+
+    src = _source_line(str(meta.get("pamphlet_name", meta.get("filename", "document"))), page_num)
+    if text_layer:
+        instr_path.write_text(f"{text_layer}\n\n{src}\n", encoding="utf-8")
+    else:
+        instr_path.write_text(f"{src}\n", encoding="utf-8")
+
+
+def _job_worker_instr_text_only_docs(job_id: str, doc_ids: list[str]) -> None:
+    """
+    Job: создать instruction.txt из текстового слоя PDF (без OCR) для всех страниц.
+    """
+    try:
+        targets: list[tuple[str, int]] = []
+        for did in doc_ids:
+            meta = _load_meta(did)
+            pages = int(meta.get("pages", 0) or 0)
+            for p in range(1, pages + 1):
+                pd = _page_dir(did, p)
+                if (pd / "instruction.txt").exists():
+                    continue
+                targets.append((did, p))
+
+        total = len(targets)
+        done = 0
+        _job_set_progress(job_id, done=done, total=total)
+
+        for did, p in targets:
+            _job_set_progress(job_id, done=done, total=total, doc_id=did, page=p)
+            _instruction_from_text_layer_page(did, p)
+            done += 1
+
+        _job_set_progress(job_id, done=done, total=total)
+        _job_finish(job_id)
+    except Exception as e:
+        _job_fail(job_id, str(e))
+
+
 def _job_worker_instr_ocr_only_docs(job_id: str, doc_ids: list[str]) -> None:
     """
     Job: создать instruction.txt из OCR для всех страниц (где ещё нет instruction.txt).
@@ -860,11 +916,12 @@ INDEX_HTML = """
     <h3>Документы</h3>
     {% if docs %}
       <form action="{{ url_for('batch_process_docs') }}" method="post">
-        <div class="row" style="align-items:center; margin-bottom: 8px;">
-          <button type="submit" name="action" value="process">Обработать выбранные документы (все страницы)</button>
-          <button type="submit" name="action" value="ocr_only">OCR только (выбранные документы)</button>
+        <div class="row" style="align-items:center; margin-bottom: 8px; flex-wrap: wrap;">
+          <button type="submit" name="action" value="process">Обработать выбранные (все страницы)</button>
+          <button type="submit" name="action" value="ocr_only">OCR только</button>
           <button type="submit" name="action" value="instr_ocr_only">Инструкция (OCR only)</button>
-          <button type="submit" name="action" value="faq">Сгенерировать FAQ для выбранных документов</button>
+          <button type="submit" name="action" value="instr_text_only" style="background:#6b7280;" title="Создать инструкции только из текстового слоя PDF, без распознавания">Инструкция из текста (без OCR)</button>
+          <button type="submit" name="action" value="faq">Сгенерировать FAQ</button>
           <span class="muted">Внимание: массовые операции могут выполняться долго.</span>
         </div>
         <table>
@@ -937,6 +994,9 @@ DOC_HTML = """
       </form>
       <form action="{{ url_for('doc_instruction_ocr_only_all', doc_id=doc_id) }}" method="post">
         <button type="submit">Инструкция (OCR only)</button>
+      </form>
+      <form action="{{ url_for('doc_instruction_text_only_all', doc_id=doc_id) }}" method="post">
+        <button type="submit" style="background:#6b7280;" title="Создать инструкции только из текстового слоя PDF, без распознавания изображений">Инструкция из текста (без OCR)</button>
       </form>
       <form action="{{ url_for('doc_faq_all', doc_id=doc_id) }}" method="post">
         <button type="submit">FAQ по всем страницам</button>
@@ -1123,12 +1183,40 @@ PAGE_HTML = """
     .status-msg.ok { color: #059669; }
     .status-msg.err { color: #dc2626; }
     .hidden { display: none; }
+    .nav-bar { display: flex; justify-content: space-between; align-items: center; gap: 16px; flex-wrap: wrap; }
+    .nav-links { display: flex; gap: 12px; align-items: center; }
+    .nav-btn {
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 8px 14px; border-radius: 8px; background: #e5e7eb; color: #111827;
+      text-decoration: none; font-weight: 500; transition: background 0.15s;
+    }
+    .nav-btn:hover { background: #d1d5db; }
+    .nav-btn.disabled { opacity: 0.4; pointer-events: none; }
+    .page-indicator { font-weight: 600; color: #374151; }
   </style>
 </head>
 <body>
+  <div class="nav-bar" style="margin-bottom: 16px;">
+    <div class="nav-links">
+      <a href="{{ url_for('doc', doc_id=doc_id) }}" class="nav-btn">← К документу</a>
+    </div>
+    <div class="nav-links">
+      {% if prev_page %}
+        <a href="{{ url_for('page', doc_id=doc_id, page_num=prev_page) }}" class="nav-btn">← Пред.</a>
+      {% else %}
+        <span class="nav-btn disabled">← Пред.</span>
+      {% endif %}
+      <span class="page-indicator">{{ "%03d"|format(page_num) }} / {{ "%03d"|format(total_pages) }}</span>
+      {% if next_page %}
+        <a href="{{ url_for('page', doc_id=doc_id, page_num=next_page) }}" class="nav-btn">След. →</a>
+      {% else %}
+        <span class="nav-btn disabled">След. →</span>
+      {% endif %}
+    </div>
+  </div>
+
   <div class="bar">
     <h2>{{ meta.get('pamphlet_name','Документ') }} — страница {{ "%03d"|format(page_num) }}</h2>
-    <a href="{{ url_for('doc', doc_id=doc_id) }}">← к документу</a>
   </div>
 
   <div class="card">
@@ -1140,6 +1228,9 @@ PAGE_HTML = """
         </form>
         <form action="{{ url_for('instruction_ocr_only_page', doc_id=doc_id, page_num=page_num) }}" method="post">
           <button type="submit" {% if not has_img %}disabled{% endif %}>Инструкция (OCR only)</button>
+        </form>
+        <form action="{{ url_for('instruction_text_only_page', doc_id=doc_id, page_num=page_num) }}" method="post">
+          <button type="submit" class="secondary" title="Создать инструкцию только из текстового слоя PDF, без распознавания изображения">Инструкция из текста (без OCR)</button>
         </form>
         <form action="{{ url_for('process_page', doc_id=doc_id, page_num=page_num) }}" method="post">
           <button type="submit">Обработать страницу (OCR+Merge + контекст)</button>
@@ -1355,6 +1446,26 @@ PAGE_HTML = """
       return div.innerHTML;
     }
   </script>
+
+  <!-- Нижняя навигация -->
+  <div class="nav-bar" style="margin-top: 24px; padding-top: 16px; border-top: 1px solid #e5e7eb;">
+    <div class="nav-links">
+      <a href="{{ url_for('doc', doc_id=doc_id) }}" class="nav-btn">← К документу</a>
+    </div>
+    <div class="nav-links">
+      {% if prev_page %}
+        <a href="{{ url_for('page', doc_id=doc_id, page_num=prev_page) }}" class="nav-btn">← Пред.</a>
+      {% else %}
+        <span class="nav-btn disabled">← Пред.</span>
+      {% endif %}
+      <span class="page-indicator">{{ "%03d"|format(page_num) }} / {{ "%03d"|format(total_pages) }}</span>
+      {% if next_page %}
+        <a href="{{ url_for('page', doc_id=doc_id, page_num=next_page) }}" class="nav-btn">След. →</a>
+      {% else %}
+        <span class="nav-btn disabled">След. →</span>
+      {% endif %}
+    </div>
+  </div>
 </body>
 </html>
 """
@@ -1457,6 +1568,11 @@ def page(doc_id: str, page_num: int):
     has_img = (pd / "page.jpg").exists()
     has_instruction = (pd / "instruction.txt").exists()
 
+    # Навигация между страницами
+    total_pages = int(meta.get("pages", 0))
+    prev_page = page_num - 1 if page_num > 1 else None
+    next_page = page_num + 1 if page_num < total_pages else None
+
     return render_template_string(
         PAGE_HTML,
         doc_id=doc_id,
@@ -1469,6 +1585,9 @@ def page(doc_id: str, page_num: int):
         ocr_text=ocr_text,
         instruction=instruction,
         faq=faq,
+        prev_page=prev_page,
+        next_page=next_page,
+        total_pages=total_pages,
     )
 
 
@@ -1630,6 +1749,22 @@ def instruction_ocr_only_page(doc_id: str, page_num: int):
     return redirect(url_for("page", doc_id=doc_id, page_num=page_num))
 
 
+@app.post("/doc/<doc_id>/page/<int:page_num>/instruction_text")
+def instruction_text_only_page(doc_id: str, page_num: int):
+    """Создать инструкцию только из текстового слоя PDF (без OCR)."""
+    try:
+        _instruction_from_text_layer_page(doc_id, page_num)
+        meta = _load_meta(doc_id)
+        if meta.get("last_error"):
+            meta.pop("last_error", None)
+            _save_meta(doc_id, meta)
+    except Exception as e:
+        meta = _load_meta(doc_id)
+        meta["last_error"] = str(e)
+        _save_meta(doc_id, meta)
+    return redirect(url_for("page", doc_id=doc_id, page_num=page_num))
+
+
 @app.post("/doc/<doc_id>/page/<int:page_num>/faq")
 def faq_page(doc_id: str, page_num: int):
     try:
@@ -1730,6 +1865,17 @@ def doc_instruction_ocr_only_all(doc_id: str):
     return redirect(url_for("job", job_id=j["job_id"]))
 
 
+@app.post("/doc/<doc_id>/instruction_text_only_all")
+def doc_instruction_text_only_all(doc_id: str):
+    """Создать инструкции из текстового слоя PDF (без OCR) для всех страниц."""
+    existing = _find_running_job_for_doc(doc_id)
+    if existing:
+        return redirect(url_for("job", job_id=existing))
+    j = _new_job("instr_text_only_docs", {"doc_ids": [doc_id]})
+    _start_job_thread(j["job_id"], _job_worker_instr_text_only_docs, [doc_id])
+    return redirect(url_for("job", job_id=j["job_id"]))
+
+
 @app.post("/doc/<doc_id>/faq_all")
 def doc_faq_all(doc_id: str):
     existing = _find_running_job_for_doc(doc_id)
@@ -1764,6 +1910,9 @@ def batch_process_docs():
     elif action == "ocr_only":
         j = _new_job("ocr_only_docs", {"doc_ids": doc_ids})
         _start_job_thread(j["job_id"], _job_worker_ocr_only_docs, doc_ids)
+    elif action == "instr_text_only":
+        j = _new_job("instr_text_only_docs", {"doc_ids": doc_ids})
+        _start_job_thread(j["job_id"], _job_worker_instr_text_only_docs, doc_ids)
     elif action == "instr_ocr_only":
         j = _new_job("instr_ocr_only_docs", {"doc_ids": doc_ids})
         _start_job_thread(j["job_id"], _job_worker_instr_ocr_only_docs, doc_ids)
