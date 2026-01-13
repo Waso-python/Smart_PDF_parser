@@ -241,8 +241,15 @@ def stage4_build_incremental_context(
     )
 
     combined_text: str | None = None
+    processed_pages: list[int] = []  # Список реальных номеров обработанных страниц
 
-    for idx, page_dir in enumerate(page_dirs, start=1):
+    for page_dir in page_dirs:
+        # Извлекаем реальный номер страницы из имени директории (page_001 -> 1)
+        try:
+            page_num = int(page_dir.name.split("_", 1)[-1])
+        except ValueError:
+            continue
+
         instr_path = page_dir / "instruction.txt"
         if not instr_path.exists():
             continue
@@ -253,7 +260,7 @@ def stage4_build_incremental_context(
         if combined_text is None:
             # Первая страница — формируем элементы сразу с тегами источника
             question = (
-                f"Перед тобой текст страницы №{idx} инструкции по работе в АС:\n"
+                f"Перед тобой текст страницы №{page_num} инструкции по работе в АС:\n"
                 "----------------------------------------\n"
                 f"{page_text}\n"
                 "----------------------------------------\n\n"
@@ -261,7 +268,7 @@ def stage4_build_incremental_context(
                 "только по этому тексту.\n\n"
                 "Требования к формату:\n"
                 f"- каждый элемент пиши с новой строки;\n"
-                f"- в КОНЦЕ каждого смыслового блока добавь тег вида [SOURCE: page {idx:03d}];\n"
+                f"- в КОНЦЕ каждого смыслового блока добавь тег вида [SOURCE: page {page_num:03d}];\n"
                 "- не добавляй информацию, которой нет в тексте страницы.\n"
                 "- не добавляй никакие пояснения, комментарии или примеры от себя."
             )
@@ -273,25 +280,26 @@ def stage4_build_incremental_context(
                 model=model,
                 temperature=temperature,
             )
+            processed_pages.append(page_num)
         else:
             # Инкрементальное уточнение/расширение с учётом новой страницы
+            pages_range = f"{processed_pages[0]}–{processed_pages[-1]}" if processed_pages else "предыдущих"
             question = (
-                f"У тебя уже есть собранная инструкция по страницам 1–{idx-1} "
+                f"У тебя уже есть собранная инструкция по страницам {pages_range} "
                 "с тегами источников [SOURCE: page XXX]:\n"
                 "----------------------------------------\n"
                 f"{combined_text}\n"
                 "----------------------------------------\n\n"
-                f"И есть текст новой страницы №{idx}:\n"
+                f"И есть текст новой страницы №{page_num}:\n"
                 "----------------------------------------\n"
                 f"{page_text}\n"
                 "----------------------------------------\n\n"
-                "Обнови общую инструкцию так, чтобы она отражала страницы 1–"
-                f"{idx} включительно.\n\n"
+                f"Обнови общую инструкцию, добавив информацию со страницы {page_num}.\n\n"
                 "Строгие правила:\n"
                 "1) НЕ удаляй и НЕ изменяй существующие строки и их теги [SOURCE: page ...], "
                 "можно только добавлять новые строки.\n"
                 "2) Для новых смысловых элементов, которые появляются только на странице "
-                f"№{idx}, добавляй строки с тегом [SOURCE: page {idx:03d}].\n"
+                f"№{page_num}, добавляй строки с тегом [SOURCE: page {page_num:03d}].\n"
                 "3) НЕЛЬЗЯ придумывать новые функции, кнопки, шаги или рекомендации, "
                 "если их нет ни в одной из страниц.\n"
                 "4) Если новая страница почти ничего не добавляет, можешь вернуть текст почти "
@@ -303,7 +311,10 @@ def stage4_build_incremental_context(
                 question=question,
                 access_token=access_token,
                 sys_prompt=sys_prompt_incremental,
+                model=model,
+                temperature=temperature,
             )
+            processed_pages.append(page_num)
 
         # Сохраняем контекст до текущей страницы включительно
         ctx_path = page_dir / "instruction_with_context.txt"
