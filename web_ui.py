@@ -417,15 +417,20 @@ def _instruction_from_ocr_only_page(
 def _instruction_from_text_layer_page(
     doc_id: str,
     page_num: int,
+    access_token: str | None = None,
     force: bool = False,
 ) -> None:
     """
-    Инструкция по странице ТОЛЬКО из текстового слоя PDF (без OCR):
-      - instruction.txt = page.txt + SOURCE
-    Полезно, когда текстовый слой качественный и OCR не нужен.
+    Инструкция по странице ТОЛЬКО из текстового слоя PDF (без OCR).
+    Текст форматируется через LLM для структурирования.
     """
     meta = _load_meta(doc_id)
+    model = meta.get("model") or os.getenv("GIGA_TEXT_MODEL", "GigaChat-2-Pro")
+    temperature = float(meta.get("temperature", 0.01))
+
+    access_token = access_token or _ensure_access_token()
     page_dir = _page_dir(doc_id, page_num)
+
     instr_path = page_dir / "instruction.txt"
     if instr_path.exists() and not force:
         return
@@ -433,11 +438,55 @@ def _instruction_from_text_layer_page(
     text_path = page_dir / "page.txt"
     text_layer = text_path.read_text(encoding="utf-8").strip() if text_path.exists() else ""
 
-    src = _source_line(str(meta.get("pamphlet_name", meta.get("filename", "document"))), page_num)
-    if text_layer:
-        instr_path.write_text(f"{text_layer}\n\n{src}\n", encoding="utf-8")
-    else:
+    if not text_layer:
+        src = _source_line(str(meta.get("pamphlet_name", meta.get("filename", "document"))), page_num)
         instr_path.write_text(f"{src}\n", encoding="utf-8")
+        return
+
+    before = get_token_stats()
+
+    # Форматируем текстовый слой через LLM
+    format_question = (
+        "Перед тобой текстовый слой страницы инструкции по работе в АС (извлечён из PDF).\n"
+        "----------------------------------------\n"
+        f"{text_layer}\n"
+        "----------------------------------------\n\n"
+        "Твоя задача — отформатировать и структурировать этот текст в читабельную инструкцию.\n\n"
+        "Строгие правила:\n"
+        "1) НЕЛЬЗЯ придумывать новые шаги, кнопки, поля, предупреждения или советы, "
+        "которых нет в исходном тексте.\n"
+        "2) Можно:\n"
+        "   - исправить переносы строк, дефисы и типографику;\n"
+        "   - убрать дубликаты и мусорные символы;\n"
+        "   - структурировать текст (разбить на абзацы, выделить шаги/пункты);\n"
+        "   - исправить очевидные опечатки.\n"
+        "3) АНТИ-МУСОР: не включай элементы интерфейса просмотрщика/браузера, "
+        "водяные знаки и прочие посторонние надписи.\n"
+        "4) Итог должен быть максимально близок к исходному тексту по содержанию.\n"
+        "5) Верни ТОЛЬКО отформатированный текст страницы, без комментариев.\n"
+    )
+
+    sys_prompt_format = (
+        "Ты опытный методолог и редактор технической документации. "
+        "Твоя задача — аккуратно отформатировать текст инструкции, "
+        "сохранив ВСЕ смысловые элементы и НЕ добавляя ничего нового. "
+        "Структурируй текст для удобства чтения: разбей на абзацы, выдели шаги."
+    )
+
+    instruction = giga_free_answer(
+        question=format_question,
+        access_token=access_token,
+        sys_prompt=sys_prompt_format,
+        model=model,
+        temperature=0.0,  # Минимум креативности
+    )
+    instr_path.write_text(instruction, encoding="utf-8")
+
+    after = get_token_stats()
+    delta = _token_delta(before, after)
+    _add_tokens(meta, delta)
+    meta["last_op"] = {"type": "format_text_layer", "page": page_num, "token_delta": delta}
+    _save_meta(doc_id, meta)
 
 
 def _instruction_merge_existing_ocr_page(
@@ -542,8 +591,10 @@ def _instruction_merge_existing_ocr_page(
 def _job_worker_instr_text_only_docs(job_id: str, doc_ids: list[str]) -> None:
     """
     Job: создать instruction.txt из текстового слоя PDF (без OCR) для всех страниц.
+    Текст форматируется через LLM.
     """
     try:
+        token = _ensure_access_token()
         targets: list[tuple[str, int]] = []
         for did in doc_ids:
             meta = _load_meta(did)
@@ -560,7 +611,7 @@ def _job_worker_instr_text_only_docs(job_id: str, doc_ids: list[str]) -> None:
 
         for did, p in targets:
             _job_set_progress(job_id, done=done, total=total, doc_id=did, page=p)
-            _instruction_from_text_layer_page(did, p)
+            _instruction_from_text_layer_page(did, p, access_token=token)
             done += 1
 
         _job_set_progress(job_id, done=done, total=total)
@@ -1902,9 +1953,10 @@ def instruction_ocr_only_page(doc_id: str, page_num: int):
 
 @app.post("/doc/<doc_id>/page/<int:page_num>/instruction_text")
 def instruction_text_only_page(doc_id: str, page_num: int):
-    """Создать инструкцию только из текстового слоя PDF (без OCR)."""
+    """Создать инструкцию только из текстового слоя PDF (без OCR), с форматированием через LLM."""
     try:
-        _instruction_from_text_layer_page(doc_id, page_num, force=True)  # Перезаписываем
+        token = _ensure_access_token()
+        _instruction_from_text_layer_page(doc_id, page_num, access_token=token, force=True)
         meta = _load_meta(doc_id)
         if meta.get("last_error"):
             meta.pop("last_error", None)
