@@ -500,7 +500,7 @@ def _job_worker_instr_ocr_only_docs(job_id: str, doc_ids: list[str]) -> None:
     except Exception as e:
         _job_fail(job_id, str(e))
 
-def _generate_faq_for_page(doc_id: str, page_num: int, access_token: str | None = None) -> None:
+def _generate_faq_for_page(doc_id: str, page_num: int, access_token: str | None = None, force: bool = False) -> None:
     meta = _load_meta(doc_id)
     model = meta.get("model") or os.getenv("GIGA_TEXT_MODEL", "GigaChat-2-Pro")
     temperature = float(meta.get("temperature", 0.01))
@@ -512,7 +512,7 @@ def _generate_faq_for_page(doc_id: str, page_num: int, access_token: str | None 
         raise FileNotFoundError("Сначала выполните обработку страницы (instruction.txt не найден).")
 
     faq_path = page_dir / "faq.md"
-    if faq_path.exists():
+    if faq_path.exists() and not force:
         # Уже создано — не пересоздаём.
         return
 
@@ -1712,7 +1712,7 @@ def download_faq_xlsx(doc_id: str):
 @app.post("/doc/<doc_id>/page/<int:page_num>/process")
 def process_page(doc_id: str, page_num: int):
     try:
-        _process_page(doc_id, page_num)
+        _process_page(doc_id, page_num, force=True)  # Перезаписываем существующие файлы
         meta = _load_meta(doc_id)
         if meta.get("last_error"):
             meta.pop("last_error", None)
@@ -1727,7 +1727,7 @@ def process_page(doc_id: str, page_num: int):
 @app.post("/doc/<doc_id>/page/<int:page_num>/ocr")
 def ocr_only_page(doc_id: str, page_num: int):
     try:
-        _ocr_only_page(doc_id, page_num)
+        _ocr_only_page(doc_id, page_num, force=True)  # Перезаписываем существующие файлы
         meta = _load_meta(doc_id)
         if meta.get("last_error"):
             meta.pop("last_error", None)
@@ -1791,7 +1791,7 @@ def ocr_table_page(doc_id: str, page_num: int):
 def instruction_ocr_only_page(doc_id: str, page_num: int):
     try:
         token = _ensure_access_token()
-        _instruction_from_ocr_only_page(doc_id, page_num, access_token=token)
+        _instruction_from_ocr_only_page(doc_id, page_num, access_token=token, force=True)  # Перезаписываем
         meta = _load_meta(doc_id)
         if meta.get("last_error"):
             meta.pop("last_error", None)
@@ -1807,7 +1807,7 @@ def instruction_ocr_only_page(doc_id: str, page_num: int):
 def instruction_text_only_page(doc_id: str, page_num: int):
     """Создать инструкцию только из текстового слоя PDF (без OCR)."""
     try:
-        _instruction_from_text_layer_page(doc_id, page_num)
+        _instruction_from_text_layer_page(doc_id, page_num, force=True)  # Перезаписываем
         meta = _load_meta(doc_id)
         if meta.get("last_error"):
             meta.pop("last_error", None)
@@ -1822,7 +1822,7 @@ def instruction_text_only_page(doc_id: str, page_num: int):
 @app.post("/doc/<doc_id>/page/<int:page_num>/faq")
 def faq_page(doc_id: str, page_num: int):
     try:
-        _generate_faq_for_page(doc_id, page_num)
+        _generate_faq_for_page(doc_id, page_num, force=True)  # Перезаписываем существующий FAQ
         meta = _load_meta(doc_id)
         if meta.get("last_error"):
             meta.pop("last_error", None)
