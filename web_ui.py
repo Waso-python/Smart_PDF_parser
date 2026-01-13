@@ -707,15 +707,10 @@ def _start_job_thread(job_id: str, target, *args) -> None:
 
 def _build_instruction_export_md(doc_id: str) -> str:
     """
-    Собираем итоговую инструкцию для выгрузки:
-    - если есть instructions_incremental.md — отдаём его;
-    - иначе — склеиваем instruction.txt по страницам с заголовками.
+    Собираем итоговую инструкцию для выгрузки.
+    Всегда собираем из отдельных instruction.txt по страницам с заголовками.
+    Это гарантирует, что все обработанные страницы попадут в итоговый файл.
     """
-    ddir = _doc_dir(doc_id)
-    inc = ddir / "instructions_incremental.md"
-    if inc.exists():
-        return inc.read_text(encoding="utf-8")
-
     meta = _load_meta(doc_id)
     pages = int(meta.get("pages", 0) or 0)
     chunks = []
