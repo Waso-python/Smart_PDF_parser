@@ -734,6 +734,7 @@ def _render_docx_from_markdown(md_text: str, title: str = "Instruction") -> byte
     """
     Конвертация Markdown → DOCX через pandoc (CLI).
     Требует установленный pandoc в окружении (или указать путь через PANDOC_PATH).
+    Устанавливает русский язык документа и простое форматирование.
     """
     pandoc = (os.getenv("PANDOC_PATH") or "pandoc").strip()
     reference_docx = (os.getenv("PANDOC_REFERENCE_DOCX") or "").strip()
@@ -750,13 +751,14 @@ def _render_docx_from_markdown(md_text: str, title: str = "Instruction") -> byte
         pandoc,
         str(md_path),
         "-f",
-        "markdown",
+        "markdown-smart",  # простой markdown без типографских замен
         "-t",
         "docx",
         "-o",
         str(docx_path),
-        "--metadata",
-        f"title={title}",
+        "--metadata", f"title={title}",
+        "--metadata", "lang=ru-RU",           # основной язык документа — русский
+        "--metadata", "author=Smart PDF Parser",
     ]
     if reference_docx:
         cmd.extend(["--reference-doc", reference_docx])
