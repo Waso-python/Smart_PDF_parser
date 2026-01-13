@@ -440,6 +440,105 @@ def _instruction_from_text_layer_page(
         instr_path.write_text(f"{src}\n", encoding="utf-8")
 
 
+def _instruction_merge_existing_ocr_page(
+    doc_id: str,
+    page_num: int,
+    access_token: str | None = None,
+    force: bool = False,
+) -> None:
+    """
+    Создать инструкцию из уже распознанного OCR (ocr.txt) и текстового слоя (page.txt).
+    Приоритет: текстовый слой — авторитетный, OCR — вспомогательный.
+    Не делает повторный OCR, использует существующий ocr.txt.
+    """
+    meta = _load_meta(doc_id)
+    model = meta.get("model") or os.getenv("GIGA_TEXT_MODEL", "GigaChat-2-Pro")
+    temperature = float(meta.get("temperature", 0.01))
+
+    access_token = access_token or _ensure_access_token()
+    page_dir = _page_dir(doc_id, page_num)
+
+    instr_path = page_dir / "instruction.txt"
+    if instr_path.exists() and not force:
+        return
+
+    text_path = page_dir / "page.txt"
+    ocr_path = page_dir / "ocr.txt"
+
+    if not text_path.exists() and not ocr_path.exists():
+        raise FileNotFoundError("Не найдены файлы page.txt и ocr.txt для merge.")
+
+    text_layer = text_path.read_text(encoding="utf-8").strip() if text_path.exists() else ""
+    ocr_text = ocr_path.read_text(encoding="utf-8").strip() if ocr_path.exists() else ""
+
+    # Если есть только один источник — используем его напрямую
+    if not text_layer and ocr_text:
+        src = _source_line(str(meta.get("pamphlet_name", meta.get("filename", "document"))), page_num)
+        instr_path.write_text(f"{ocr_text}\n\n{src}\n", encoding="utf-8")
+        return
+    if text_layer and not ocr_text:
+        src = _source_line(str(meta.get("pamphlet_name", meta.get("filename", "document"))), page_num)
+        instr_path.write_text(f"{text_layer}\n\n{src}\n", encoding="utf-8")
+        return
+
+    before = get_token_stats()
+
+    # Merge с приоритетом текстового слоя
+    merge_question = (
+        "У тебя есть две версии ОДНОЙ И ТОЙ ЖЕ страницы инструкции по работе в АС.\n\n"
+        "ВЕРСИЯ A (АВТОРИТЕТНАЯ): текстовый слой страницы (из PDF).\n"
+        "Это основной источник истины: он должен определять формулировки, порядок и содержание.\n"
+        "----------------------------------------\n"
+        f"{text_layer}\n"
+        "----------------------------------------\n\n"
+        "ВЕРСИЯ B (ВСПОМОГАТЕЛЬНАЯ): текст, полученный OCR по скриншоту той же страницы.\n"
+        "OCR может содержать мусор (артефакты, обрывки UI-обвязки, водяные знаки, ошибки распознавания).\n"
+        "Используй OCR ТОЛЬКО как подсказку для восстановления явно ПРОПУЩЕННЫХ фрагментов, "
+        "если они отсутствуют в версии A, но хорошо читаются в версии B.\n"
+        "----------------------------------------\n"
+        f"{ocr_text}\n"
+        "----------------------------------------\n\n"
+        "Твоя задача — сделать один аккуратный итоговый текст этой страницы.\n\n"
+        "Строгие правила (критично):\n"
+        "1) ПРИОРИТЕТ: если версия A содержит фразу/пункт, а версия B отличается или противоречит — "
+        "ВСЕГДА выбирай версию A. Не «улучшай» и не переписывай по OCR.\n"
+        "2) OCR-добавления разрешены ТОЛЬКО если:\n"
+        "   - в версии A есть очевидный пропуск/пустое место/обрыв строки, и\n"
+        "   - в версии B этот же фрагмент читается ясно, и\n"
+        "   - добавление не похоже на UI-обвязку/шум/водяной знак/служебный текст.\n"
+        "   Если есть сомнение — НЕ добавляй.\n"
+        "3) АНТИ-МУСОР: не включай в итоговый текст элементы интерфейса/просмотрщика/браузера, "
+        "водяные знаки и прочие посторонние надписи.\n"
+        "4) НЕЛЬЗЯ придумывать ни одного нового шага, кнопки, поля, предупреждения.\n"
+        "5) Итог должен быть максимально близок к версии A по содержанию. "
+        "Верни ТОЛЬКО итоговый текст страницы, без комментариев.\n"
+    )
+
+    sys_prompt_merge = (
+        "Ты опытный методолог и сотрудник кредитного отдела банка. "
+        "Твоя задача — строго и аккуратно объединять две версии одной страницы "
+        "в единый текст БЕЗ добавления новых смыслов.\n"
+        "Критично: версия A (текстовый слой PDF) — авторитетная. "
+        "Версия B (OCR) — только вспомогательная. "
+        "Если есть конфликт — выбирай версию A."
+    )
+
+    instruction = giga_free_answer(
+        question=merge_question,
+        access_token=access_token,
+        sys_prompt=sys_prompt_merge,
+        model=model,
+        temperature=0.0,  # Минимум креативности для merge
+    )
+    instr_path.write_text(instruction, encoding="utf-8")
+
+    after = get_token_stats()
+    delta = _token_delta(before, after)
+    _add_tokens(meta, delta)
+    meta["last_op"] = {"type": "merge_existing_ocr", "page": page_num, "token_delta": delta}
+    _save_meta(doc_id, meta)
+
+
 def _job_worker_instr_text_only_docs(job_id: str, doc_ids: list[str]) -> None:
     """
     Job: создать instruction.txt из текстового слоя PDF (без OCR) для всех страниц.
@@ -1233,6 +1332,9 @@ PAGE_HTML = """
         <form action="{{ url_for('instruction_text_only_page', doc_id=doc_id, page_num=page_num) }}" method="post">
           <button type="submit" class="secondary" title="Создать инструкцию только из текстового слоя PDF, без распознавания изображения">Инструкция из текста (без OCR)</button>
         </form>
+        <form action="{{ url_for('instruction_merge_page', doc_id=doc_id, page_num=page_num) }}" method="post">
+          <button type="submit" style="background:#0891b2;" title="Объединить существующий OCR и текстовый слой с приоритетом текста (без повторного OCR)">Merge (текст + OCR)</button>
+        </form>
         <form action="{{ url_for('process_page', doc_id=doc_id, page_num=page_num) }}" method="post">
           <button type="submit">Обработать страницу (OCR+Merge + контекст)</button>
         </form>
@@ -1803,6 +1905,23 @@ def instruction_text_only_page(doc_id: str, page_num: int):
     """Создать инструкцию только из текстового слоя PDF (без OCR)."""
     try:
         _instruction_from_text_layer_page(doc_id, page_num, force=True)  # Перезаписываем
+        meta = _load_meta(doc_id)
+        if meta.get("last_error"):
+            meta.pop("last_error", None)
+            _save_meta(doc_id, meta)
+    except Exception as e:
+        meta = _load_meta(doc_id)
+        meta["last_error"] = str(e)
+        _save_meta(doc_id, meta)
+    return redirect(url_for("page", doc_id=doc_id, page_num=page_num))
+
+
+@app.post("/doc/<doc_id>/page/<int:page_num>/instruction_merge")
+def instruction_merge_page(doc_id: str, page_num: int):
+    """Создать инструкцию из существующего OCR и текстового слоя (merge с приоритетом текста)."""
+    try:
+        token = _ensure_access_token()
+        _instruction_merge_existing_ocr_page(doc_id, page_num, access_token=token, force=True)
         meta = _load_meta(doc_id)
         if meta.get("last_error"):
             meta.pop("last_error", None)
