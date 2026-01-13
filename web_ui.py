@@ -24,6 +24,7 @@ from flask import (
 from img_parse import get_creds, get_token_stats, ocr_instruction_via_rest, giga_free_answer
 from process_pamphlets import stage4_build_incremental_context
 from generate_faq import generate_faq_for_pages, _build_doc_context
+from table_parser import parse_table_from_image
 from openpyxl import Workbook
 
 
@@ -1228,6 +1229,9 @@ PAGE_HTML = """
         <form action="{{ url_for('ocr_only_page', doc_id=doc_id, page_num=page_num) }}" method="post">
           <button type="submit" {% if not has_img %}disabled{% endif %}>OCR только</button>
         </form>
+        <form action="{{ url_for('ocr_table_page', doc_id=doc_id, page_num=page_num) }}" method="post">
+          <button type="submit" {% if not has_img %}disabled{% endif %} style="background:#7c3aed;" title="Распознать таблицу на странице (результат в поле OCR)">🗃️ Распознать таблицу</button>
+        </form>
         <form action="{{ url_for('instruction_ocr_only_page', doc_id=doc_id, page_num=page_num) }}" method="post">
           <button type="submit" {% if not has_img %}disabled{% endif %}>Инструкция (OCR only)</button>
         </form>
@@ -1732,6 +1736,54 @@ def ocr_only_page(doc_id: str, page_num: int):
         meta = _load_meta(doc_id)
         meta["last_error"] = str(e)
         _save_meta(doc_id, meta)
+    return redirect(url_for("page", doc_id=doc_id, page_num=page_num))
+
+
+@app.post("/doc/<doc_id>/page/<int:page_num>/ocr_table")
+def ocr_table_page(doc_id: str, page_num: int):
+    """Распознать таблицу на странице. Результат сохраняется в ocr.txt."""
+    try:
+        meta = _load_meta(doc_id)
+        model = meta.get("model") or os.getenv("GIGA_VISION_MODEL", "GigaChat-2-Pro")
+        temperature = float(meta.get("temperature", 0.01))
+        pamphlet_name = meta.get("pamphlet_name", meta.get("filename", "document"))
+
+        page_dir = _page_dir(doc_id, page_num)
+        img_path = page_dir / "page.jpg"
+        if not img_path.exists():
+            raise FileNotFoundError("Не найден файл страницы (page.jpg).")
+
+        token = _ensure_access_token()
+        before = get_token_stats()
+
+        # Используем table_parser для распознавания таблицы
+        table_text = parse_table_from_image(
+            str(img_path),
+            access_token=token,
+            output_format="markdown",
+            model=model,
+            temperature=temperature,
+            context=f"Таблица из памятки «{pamphlet_name}», страница {page_num}",
+        )
+
+        # Сохраняем результат в ocr.txt
+        ocr_path = page_dir / "ocr.txt"
+        ocr_path.write_text(table_text, encoding="utf-8")
+
+        after = get_token_stats()
+        delta = _token_delta(before, after)
+        _add_tokens(meta, delta)
+        meta["last_op"] = {"type": "ocr_table", "page": page_num, "token_delta": delta}
+
+        if meta.get("last_error"):
+            meta.pop("last_error", None)
+        _save_meta(doc_id, meta)
+
+    except Exception as e:
+        meta = _load_meta(doc_id)
+        meta["last_error"] = str(e)
+        _save_meta(doc_id, meta)
+
     return redirect(url_for("page", doc_id=doc_id, page_num=page_num))
 
 
