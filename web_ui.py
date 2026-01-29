@@ -3,6 +3,7 @@ import os
 import uuid
 import threading
 import subprocess
+import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, Tuple
@@ -36,6 +37,32 @@ APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
 JOBS_DIR = (APP_DATA_DIR / "_jobs").resolve()
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
 
+LOGGER = logging.getLogger("web_ui")
+LOG_LOCK = threading.Lock()
+
+
+def _setup_logging() -> None:
+    with LOG_LOCK:
+        if LOGGER.handlers:
+            return
+        level_name = (os.getenv("WEB_LOG_LEVEL", "INFO") or "").strip().upper()
+        level = getattr(logging, level_name, logging.INFO)
+        LOGGER.setLevel(level)
+
+        log_path = os.getenv("WEB_LOG_FILE", str(APP_DATA_DIR / "web_ui.log"))
+        fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+
+        file_handler = logging.FileHandler(log_path, encoding="utf-8")
+        file_handler.setLevel(level)
+        file_handler.setFormatter(fmt)
+        LOGGER.addHandler(file_handler)
+
+        console = logging.StreamHandler()
+        console.setLevel(level)
+        console.setFormatter(fmt)
+        LOGGER.addHandler(console)
+
+        LOGGER.info("Логирование включено. Файл: %s", log_path)
 JOBS_LOCK = threading.Lock()
 JOB_THREADS: dict[str, threading.Thread] = {}
 
@@ -184,6 +211,7 @@ def _job_finish(job_id: str) -> None:
 
 
 def _job_fail(job_id: str, error: str) -> None:
+    LOGGER.error("JOB %s: ошибка: %s", job_id, error)
     _job_update(
         job_id,
         status="error",
@@ -595,6 +623,7 @@ def _job_worker_instr_text_only_docs(job_id: str, doc_ids: list[str]) -> None:
     Текст форматируется через LLM.
     """
     try:
+        LOGGER.info("JOB %s: instr_text_only start. docs=%s", job_id, ",".join(doc_ids))
         token = _ensure_access_token()
         targets: list[tuple[str, int]] = []
         for did in doc_ids:
@@ -611,13 +640,16 @@ def _job_worker_instr_text_only_docs(job_id: str, doc_ids: list[str]) -> None:
         _job_set_progress(job_id, done=done, total=total)
 
         for did, p in targets:
+            LOGGER.info("JOB %s: instr_text_only doc=%s page=%s", job_id, did, p)
             _job_set_progress(job_id, done=done, total=total, doc_id=did, page=p)
             _instruction_from_text_layer_page(did, p, access_token=token)
             done += 1
 
         _job_set_progress(job_id, done=done, total=total)
+        LOGGER.info("JOB %s: instr_text_only done. total=%s", job_id, total)
         _job_finish(job_id)
     except Exception as e:
+        LOGGER.exception("JOB %s: instr_text_only failed", job_id)
         _job_fail(job_id, str(e))
 
 
@@ -626,6 +658,7 @@ def _job_worker_instr_ocr_only_docs(job_id: str, doc_ids: list[str]) -> None:
     Job: создать instruction.txt из OCR для всех страниц (где ещё нет instruction.txt).
     """
     try:
+        LOGGER.info("JOB %s: instr_ocr_only start. docs=%s", job_id, ",".join(doc_ids))
         token = _ensure_access_token()
         targets: list[tuple[str, int]] = []
         for did in doc_ids:
@@ -642,13 +675,16 @@ def _job_worker_instr_ocr_only_docs(job_id: str, doc_ids: list[str]) -> None:
         _job_set_progress(job_id, done=done, total=total)
 
         for did, p in targets:
+            LOGGER.info("JOB %s: instr_ocr_only doc=%s page=%s", job_id, did, p)
             _job_set_progress(job_id, done=done, total=total, doc_id=did, page=p)
             _instruction_from_ocr_only_page(did, p, access_token=token)
             done += 1
 
         _job_set_progress(job_id, done=done, total=total)
+        LOGGER.info("JOB %s: instr_ocr_only done. total=%s", job_id, total)
         _job_finish(job_id)
     except Exception as e:
+        LOGGER.exception("JOB %s: instr_ocr_only failed", job_id)
         _job_fail(job_id, str(e))
 
 def _generate_faq_for_page(doc_id: str, page_num: int, access_token: str | None = None, force: bool = False) -> None:
@@ -745,6 +781,7 @@ def _job_worker_process_docs(job_id: str, doc_ids: list[str]) -> None:
     Job: обработать все страницы для списка документов.
     """
     try:
+        LOGGER.info("JOB %s: process_docs start. docs=%s", job_id, ",".join(doc_ids))
         token = _ensure_access_token()
         # total = только страницы, которые ещё не обработаны (нет instruction.txt)
         targets: list[tuple[str, int]] = []
@@ -762,13 +799,16 @@ def _job_worker_process_docs(job_id: str, doc_ids: list[str]) -> None:
         _job_set_progress(job_id, done=done, total=total)
 
         for did, p in targets:
+            LOGGER.info("JOB %s: process_docs doc=%s page=%s", job_id, did, p)
             _job_set_progress(job_id, done=done, total=total, doc_id=did, page=p)
             _process_page(did, p, access_token=token)
             done += 1
 
         _job_set_progress(job_id, done=done, total=total)
+        LOGGER.info("JOB %s: process_docs done. total=%s", job_id, total)
         _job_finish(job_id)
     except Exception as e:
+        LOGGER.exception("JOB %s: process_docs failed", job_id)
         _job_fail(job_id, str(e))
 
 
@@ -777,6 +817,7 @@ def _job_worker_ocr_only_docs(job_id: str, doc_ids: list[str]) -> None:
     Job: простой OCR по всем страницам документов (где ещё нет ocr.txt).
     """
     try:
+        LOGGER.info("JOB %s: ocr_only start. docs=%s", job_id, ",".join(doc_ids))
         token = _ensure_access_token()
         targets: list[tuple[str, int]] = []
         for did in doc_ids:
@@ -793,13 +834,16 @@ def _job_worker_ocr_only_docs(job_id: str, doc_ids: list[str]) -> None:
         _job_set_progress(job_id, done=done, total=total)
 
         for did, p in targets:
+            LOGGER.info("JOB %s: ocr_only doc=%s page=%s", job_id, did, p)
             _job_set_progress(job_id, done=done, total=total, doc_id=did, page=p)
             _ocr_only_page(did, p, access_token=token)
             done += 1
 
         _job_set_progress(job_id, done=done, total=total)
+        LOGGER.info("JOB %s: ocr_only done. total=%s", job_id, total)
         _job_finish(job_id)
     except Exception as e:
+        LOGGER.exception("JOB %s: ocr_only failed", job_id)
         _job_fail(job_id, str(e))
 
 
@@ -808,6 +852,7 @@ def _job_worker_faq_docs(job_id: str, doc_ids: list[str]) -> None:
     Job: сгенерировать FAQ для всех страниц документов, где уже есть instruction.txt.
     """
     try:
+        LOGGER.info("JOB %s: faq_docs start. docs=%s", job_id, ",".join(doc_ids))
         token = _ensure_access_token()
         # total = только страницы, где есть instruction.txt, но нет faq.md
         page_targets: list[tuple[str, int]] = []
@@ -839,13 +884,16 @@ def _job_worker_faq_docs(job_id: str, doc_ids: list[str]) -> None:
             return
 
         for did, p in page_targets:
+            LOGGER.info("JOB %s: faq_docs doc=%s page=%s", job_id, did, p)
             _job_set_progress(job_id, done=done, total=total, doc_id=did, page=p)
             _generate_faq_for_page(did, p, access_token=token)
             done += 1
 
         _job_set_progress(job_id, done=done, total=total)
+        LOGGER.info("JOB %s: faq_docs done. total=%s", job_id, total)
         _job_finish(job_id)
     except Exception as e:
+        LOGGER.exception("JOB %s: faq_docs failed", job_id)
         _job_fail(job_id, str(e))
 
 
@@ -853,6 +901,7 @@ def _start_job_thread(job_id: str, target, *args) -> None:
     t = threading.Thread(target=target, args=(job_id, *args), daemon=True)
     with JOBS_LOCK:
         JOB_THREADS[job_id] = t
+    LOGGER.info("JOB %s: thread started (%s)", job_id, target.__name__)
     t.start()
 
 
@@ -2146,7 +2195,45 @@ def batch_process_docs():
 def main():
     host = os.getenv("WEB_HOST", "127.0.0.1")
     port = int(os.getenv("WEB_PORT", "8000"))
+    _setup_logging()
+    _startup_check_gigachat()
     app.run(host=host, port=port, debug=False)
+
+
+def _startup_check_gigachat() -> None:
+    """
+    Проверка доступности GigaChat при старте приложения.
+    Можно отключить через GIGA_STARTUP_CHECK=0.
+    Если GIGA_STARTUP_FAIL=1 — падать при ошибке.
+    """
+    enabled = (os.getenv("GIGA_STARTUP_CHECK", "1") or "").strip().lower() not in ("0", "false", "no", "off")
+    fail_on_error = (os.getenv("GIGA_STARTUP_FAIL", "0") or "").strip().lower() in ("1", "true", "yes", "on")
+    if not enabled:
+        return
+
+    try:
+        creds = get_creds()
+        access_token = creds.get("access_token")
+        auth_mode = str(creds.get("auth_mode") or "token")
+        if not access_token and auth_mode != "cert":
+            raise RuntimeError(f"Токен не получен от NGW. Ответ: {creds}")
+
+        # Текстовый ping. В cert-режиме может идти без Bearer-токена.
+        resp = giga_free_answer(
+            question="ping",
+            access_token=access_token,
+            sys_prompt="Ответь одним словом: pong.",
+            max_tokens=5,
+            temperature=0.0,
+        )
+        if not str(resp).strip():
+            raise RuntimeError("Пустой ответ от GigaChat.")
+        print("GigaChat: проверка подключения успешна.")
+    except Exception as e:
+        msg = f"GigaChat: проверка подключения неуспешна: {e}"
+        if fail_on_error:
+            raise RuntimeError(msg) from e
+        print(msg)
 
 
 if __name__ == "__main__":

@@ -370,6 +370,10 @@ python web_ui.py
 | `GIGA_FILES_TIMEOUT` | Таймаут upload /files |
 | `GIGA_OCR_TIMEOUT` | Таймаут мультимодальных OCR-запросов |
 | `GIGA_TABLE_TIMEOUT` | Таймаут распознавания таблиц |
+| `GIGA_STARTUP_CHECK` | Проверка GigaChat при старте Web UI (1/0) |
+| `GIGA_STARTUP_FAIL` | Падать при неуспешной проверке (1/0) |
+| `WEB_LOG_FILE` | Файл логов Web UI (по умолчанию `out/web/web_ui.log`) |
+| `WEB_LOG_LEVEL` | Уровень логирования Web UI (`INFO`, `DEBUG`, ...) |
 | `WEB_HOST` | Хост для Web UI (по умолчанию `127.0.0.1`) |
 | `WEB_PORT` | Порт для Web UI (по умолчанию `8000`) |
 | `PANDOC_PATH` | Путь к pandoc (если не в PATH) |

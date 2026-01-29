@@ -5,10 +5,18 @@ import datetime
 import base64
 import io
 import requests
+import logging
+import time
 
 from dotenv import load_dotenv
 
 load_dotenv()
+
+if not logging.getLogger("gigachat").handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
 
 # ---------- Настройки ----------
 
@@ -58,6 +66,8 @@ GIGA_REQUEST_TIMEOUT = _parse_timeout(os.getenv("GIGA_REQUEST_TIMEOUT"), 120.0)
 GIGA_FILES_TIMEOUT = _parse_timeout(os.getenv("GIGA_FILES_TIMEOUT"), 120.0)
 GIGA_OCR_TIMEOUT = _parse_timeout(os.getenv("GIGA_OCR_TIMEOUT"), 120.0)
 GIGA_TABLE_TIMEOUT = _parse_timeout(os.getenv("GIGA_TABLE_TIMEOUT"), 180.0)
+
+LOGGER = logging.getLogger("gigachat")
 
 # эндпоинт NGW для получения токена
 NGW_URL = os.getenv(
@@ -196,40 +206,38 @@ def _post_with_optional_token(
         timeout = GIGA_REQUEST_TIMEOUT
     kwargs = _transport_kwargs()
 
-    # 1) cert-first
-    if has_cert and not (GIGA_FORCE_TOKEN_AUTH or force_token_auth):
-        resp = requests.post(
-            url,
-            headers=headers_base,
-            json=json_payload,
-            data=data_payload,
-            files=files_payload,
-            timeout=timeout,
-            **kwargs,
-        )
-        if resp.status_code in (401, 403) and access_token:
-            resp2 = requests.post(
+    def _do_post(headers: dict) -> requests.Response:
+        started = time.monotonic()
+        try:
+            return requests.post(
                 url,
-                headers=headers_token,
+                headers=headers,
                 json=json_payload,
                 data=data_payload,
                 files=files_payload,
                 timeout=timeout,
                 **kwargs,
             )
+        except requests.exceptions.Timeout as e:
+            LOGGER.warning("Timeout GigaChat: url=%s timeout=%s", url, timeout)
+            raise RuntimeError(f"Таймаут запроса к GigaChat ({timeout}). URL: {url}") from e
+        except requests.exceptions.RequestException as e:
+            LOGGER.warning("Ошибка запроса GigaChat: url=%s err=%s", url, e)
+            raise
+        finally:
+            elapsed = time.monotonic() - started
+            LOGGER.info("GigaChat request done: url=%s elapsed=%.2fs", url, elapsed)
+
+    # 1) cert-first
+    if has_cert and not (GIGA_FORCE_TOKEN_AUTH or force_token_auth):
+        resp = _do_post(headers_base)
+        if resp.status_code in (401, 403) and access_token:
+            resp2 = _do_post(headers_token)
             return resp2
         return resp
 
     # 2) token-only
-    return requests.post(
-        url,
-        headers=headers_token,
-        json=json_payload,
-        data=data_payload,
-        files=files_payload,
-        timeout=timeout,
-        **kwargs,
-    )
+    return _do_post(headers_token)
 
 
 def get_creds() -> dict:
