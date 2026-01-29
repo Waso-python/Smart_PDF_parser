@@ -33,7 +33,7 @@ def stage2_build_instruction_for_page_ocr_only(
     Режим OCR-only:
       - один мультимодальный вызов (ocr_instruction_via_rest)
       - instruction.txt = OCR-текст + строка источника
-    Без merge и без incremental.
+    Без merge.
     """
     ocr_text = ocr_instruction_via_rest(
         str(image_path),
@@ -202,134 +202,6 @@ def stage3_merge_pdf_instructions(pdf_dir: Path) -> Path:
     return merged_path
 
 
-def stage4_build_incremental_context(
-    pdf_dir: Path,
-    access_token: str,
-    model: str | None = None,
-    temperature: float | None = None,
-) -> Path:
-    """
-    Этап 4.
-    Инкрементально наращиваем «смысл» инструкции по мере чтения страниц:
-      - для страницы 1 контекст = её инструкция;
-      - для каждой следующей страницы учитываем уже собранный контекст + текущую инструкцию;
-      - работаем ТОЛЬКО с текстом (instruction.txt), без картинок.
-
-    На выходе:
-      - по каждой странице: instruction_with_context.txt (контекст до этой страницы включительно);
-      - общий файл: instructions_incremental.md с полной инструкцией по документу.
-    """
-    page_dirs = sorted(
-        [p for p in pdf_dir.iterdir() if p.is_dir() and p.name.startswith("page_")]
-    )
-
-    if not page_dirs:
-        return pdf_dir / "instructions_incremental.md"
-
-    sys_prompt_incremental = (
-        "Ты опытный методолог и сотрудник кредитного отдела банка. "
-        "Ты собираешь единую подробную инструкцию по работе в АС из нескольких страниц.\n"
-        "- Ты НИКОГДА не придумываешь новых шагов, сценариев, кнопок или рекомендаций,\n"
-        "  которых нет в текстах страниц.\n"
-        "- Твоя особенность — ты всегда помечаешь каждый смысловой элемент тегом источника "
-        "вида [SOURCE: page XXX], где XXX — номер страницы, на которой этот элемент появился.\n"
-        "- Ты можешь только:\n"
-        "  * объединять и упорядочивать уже имеющиеся шаги;\n"
-        "  * убирать повторы;\n"
-        "  * НЕ менять смысл уже существующих элементов.\n"
-        "- Любая новая идея, не подтверждённая текстом страниц, считается ошибкой."
-    )
-
-    combined_text: str | None = None
-    processed_pages: list[int] = []  # Список реальных номеров обработанных страниц
-
-    for page_dir in page_dirs:
-        # Извлекаем реальный номер страницы из имени директории (page_001 -> 1)
-        try:
-            page_num = int(page_dir.name.split("_", 1)[-1])
-        except ValueError:
-            continue
-
-        instr_path = page_dir / "instruction.txt"
-        if not instr_path.exists():
-            continue
-        page_text = instr_path.read_text(encoding="utf-8").strip()
-        if not page_text:
-            continue
-
-        if combined_text is None:
-            # Первая страница — формируем элементы сразу с тегами источника
-            question = (
-                f"Перед тобой текст страницы №{page_num} инструкции по работе в АС:\n"
-                "----------------------------------------\n"
-                f"{page_text}\n"
-                "----------------------------------------\n\n"
-                "Сформируй список смысловых элементов (шаги, правила, предупреждения, заголовки разделов) "
-                "только по этому тексту.\n\n"
-                "Требования к формату:\n"
-                f"- каждый элемент пиши с новой строки;\n"
-                f"- в КОНЦЕ каждого смыслового блока добавь тег вида [SOURCE: page {page_num:03d}];\n"
-                "- не добавляй информацию, которой нет в тексте страницы.\n"
-                "- не добавляй никакие пояснения, комментарии или примеры от себя."
-            )
-
-            combined_text = giga_free_answer(
-                question=question,
-                access_token=access_token,
-                sys_prompt=sys_prompt_incremental,
-                model=model,
-                temperature=temperature,
-            )
-            processed_pages.append(page_num)
-        else:
-            # Инкрементальное уточнение/расширение с учётом новой страницы
-            pages_range = f"{processed_pages[0]}–{processed_pages[-1]}" if processed_pages else "предыдущих"
-            question = (
-                f"У тебя уже есть собранная инструкция по страницам {pages_range} "
-                "с тегами источников [SOURCE: page XXX]:\n"
-                "----------------------------------------\n"
-                f"{combined_text}\n"
-                "----------------------------------------\n\n"
-                f"И есть текст новой страницы №{page_num}:\n"
-                "----------------------------------------\n"
-                f"{page_text}\n"
-                "----------------------------------------\n\n"
-                f"Обнови общую инструкцию, добавив информацию со страницы {page_num}.\n\n"
-                "Строгие правила:\n"
-                "1) НЕ удаляй и НЕ изменяй существующие строки и их теги [SOURCE: page ...], "
-                "можно только добавлять новые строки.\n"
-                "2) Для новых смысловых элементов, которые появляются только на странице "
-                f"№{page_num}, добавляй строки с тегом [SOURCE: page {page_num:03d}].\n"
-                "3) НЕЛЬЗЯ придумывать новые функции, кнопки, шаги или рекомендации, "
-                "если их нет ни в одной из страниц.\n"
-                "4) Если новая страница почти ничего не добавляет, можешь вернуть текст почти "
-                "без изменений.\n"
-                "5) Верни только итоговый текст инструкции с тегами, без пояснений и комментариев."
-            )
-
-            combined_text = giga_free_answer(
-                question=question,
-                access_token=access_token,
-                sys_prompt=sys_prompt_incremental,
-                model=model,
-                temperature=temperature,
-            )
-            processed_pages.append(page_num)
-
-        # Сохраняем контекст до текущей страницы включительно
-        ctx_path = page_dir / "instruction_with_context.txt"
-        ctx_path.write_text(combined_text, encoding="utf-8")
-
-    # Итоговый файл по всему документу
-    incremental_path = pdf_dir / "instructions_incremental.md"
-    if combined_text is None:
-        incremental_path.write_text("", encoding="utf-8")
-    else:
-        incremental_path.write_text(combined_text, encoding="utf-8")
-
-    return incremental_path
-
-
 def run_pipeline(pdf_dir: Path, out_root: Path, mode: str = "full") -> None:
     """
     Запускает все три этапа пайплайна для всех PDF в указанном каталоге.
@@ -396,18 +268,11 @@ def run_pipeline(pdf_dir: Path, out_root: Path, mode: str = "full") -> None:
         merged_path = stage3_merge_pdf_instructions(pdf_out_dir)
         print(f"Этап 3: итоговый документ (страницы по отдельности): {merged_path}")
 
-        # Этап 4: инкрементальное накопление смысла по страницам
-        if mode != "ocr_only":
-            incremental_path = stage4_build_incremental_context(pdf_out_dir, access_token)
-            print(f"Этап 4: итоговый документ с накопленным контекстом: {incremental_path}")
-        else:
-            print("Этап 4: пропущен (режим ocr_only — без incremental).")
-
-        # Этап 5 (опционально): FAQ в Excel по всем страницам
+        # Этап 4 (опционально): FAQ в Excel по всем страницам
         if os.getenv("GENERATE_FAQ_XLSX", "0") == "1":
             print("Этап 5: генерация FAQ (Excel) по всем страницам...")
-            doc_text = incremental_path.read_text(encoding="utf-8") if incremental_path.exists() else ""
-            doc_ctx = _build_doc_context(doc_text, max_chars=12000)
+            merged_text = merged_path.read_text(encoding="utf-8") if merged_path.exists() else ""
+            doc_ctx = _build_doc_context(merged_text, max_chars=12000)
 
             pages_for_faq = []
             for info in page_infos:
@@ -477,7 +342,7 @@ def main() -> None:
         type=str,
         default="full",
         choices=["full", "ocr_only"],
-        help="Режим обработки: full = OCR+merge+incremental; ocr_only = только OCR (instruction.txt из OCR + SOURCE, без incremental).",
+        help="Режим обработки: full = OCR+merge; ocr_only = только OCR (instruction.txt из OCR + SOURCE).",
     )
 
     args = parser.parse_args()

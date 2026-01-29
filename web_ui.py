@@ -23,7 +23,6 @@ from flask import (
 )
 
 from img_parse import get_creds, get_token_stats, ocr_instruction_via_rest, giga_free_answer
-from process_pamphlets import stage4_build_incremental_context
 from generate_faq import generate_faq_for_pages, _build_doc_context
 from table_parser import parse_table_from_image
 from openpyxl import Workbook
@@ -353,13 +352,6 @@ def _process_page(
     )
     instr_path.write_text(instruction, encoding="utf-8")
 
-    # Обновляем инкрементальный контекст (только по тексту instruction.txt)
-    stage4_build_incremental_context(
-        pdf_dir=_doc_dir(doc_id),
-        access_token=access_token,
-        model=model,
-        temperature=temperature,
-    )
 
     after = get_token_stats()
     delta = _token_delta(before, after)
@@ -376,7 +368,7 @@ def _ocr_only_page(
 ) -> None:
     """
     Простая обработка: только OCR по page.jpg → ocr.txt
-    Без merge и без incremental.
+    Без merge.
     """
     meta = _load_meta(doc_id)
     model = meta.get("model") or os.getenv("GIGA_TEXT_MODEL", "GigaChat-2-Pro")
@@ -422,7 +414,7 @@ def _instruction_from_ocr_only_page(
     Инструкция по странице ТОЛЬКО из OCR:
       - гарантируем наличие ocr.txt (делаем OCR если нет)
       - instruction.txt = ocr.txt + SOURCE
-    Без merge и без incremental.
+    Без merge.
     """
     meta = _load_meta(doc_id)
     page_dir = _page_dir(doc_id, page_num)
@@ -467,6 +459,11 @@ def _instruction_from_text_layer_page(
     text_layer = text_path.read_text(encoding="utf-8").strip() if text_path.exists() else ""
 
     if not text_layer:
+        LOGGER.info(
+            "doc=%s page=%s: text-only skip LLM (empty page.txt)",
+            doc_id,
+            page_num,
+        )
         src = _source_line(str(meta.get("pamphlet_name", meta.get("filename", "document"))), page_num)
         instr_path.write_text(f"{src}\n", encoding="utf-8")
         return
@@ -638,6 +635,17 @@ def _job_worker_instr_text_only_docs(job_id: str, doc_ids: list[str]) -> None:
         total = len(targets)
         done = 0
         _job_set_progress(job_id, done=done, total=total)
+        if total == 0:
+            _job_update(
+                job_id,
+                message=(
+                    "Нечего делать: все страницы уже имеют instruction.txt. "
+                    "Если нужно пересоздать — удалите instruction.txt или используйте обработку поштучно."
+                ),
+            )
+            LOGGER.info("JOB %s: instr_text_only nothing to do", job_id)
+            _job_finish(job_id)
+            return
 
         for did, p in targets:
             LOGGER.info("JOB %s: instr_text_only doc=%s page=%s", job_id, did, p)
@@ -703,12 +711,8 @@ def _generate_faq_for_page(doc_id: str, page_num: int, access_token: str | None 
         # Уже создано — не пересоздаём.
         return
 
-    # Контекст документа: берём инкрементальный или merged, если есть
-    inc_path = _doc_dir(doc_id) / "instructions_incremental.md"
-    if inc_path.exists():
-        doc_text = inc_path.read_text(encoding="utf-8")
-    else:
-        doc_text = instr_path.read_text(encoding="utf-8")
+    # Контекст документа: используем текущую инструкцию страницы
+    doc_text = instr_path.read_text(encoding="utf-8")
 
     doc_ctx = _build_doc_context(doc_text, max_chars=12000)
     page_text = instr_path.read_text(encoding="utf-8")

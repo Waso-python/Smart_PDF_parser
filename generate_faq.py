@@ -40,7 +40,7 @@ def _split_by_page_headers(md: str) -> List[Tuple[int, str]]:
 
 def _group_lines_by_source_tags(md: str) -> Dict[int, List[str]]:
     """
-    Парсинг формата instructions_incremental.md:
+    Парсинг формата с тегами источников:
     каждая смысловая строка содержит [SOURCE: page XXX]
     """
     groups: Dict[int, List[str]] = {}
@@ -247,7 +247,7 @@ def main() -> None:
         "--md",
         type=str,
         required=True,
-        help="Путь к markdown-файлу (например out/<pdf>/instructions_merged.md или instructions_incremental.md).",
+        help="Путь к markdown-файлу (например out/<pdf>/instructions_merged.md).",
     )
     parser.add_argument(
         "--out",
