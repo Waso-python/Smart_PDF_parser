@@ -14,7 +14,14 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from img_parse import get_creds, giga_free_answer, ocr_instruction_via_rest, upload_image_to_files, get_token_stats
+from img_parse import (
+    get_creds,
+    giga_free_answer,
+    ocr_instruction_via_rest,
+    upload_image_to_files,
+    get_token_stats,
+    GIGA_TABLE_TIMEOUT,
+)
 
 load_dotenv()
 
@@ -63,8 +70,13 @@ def parse_table_from_image(
     if access_token is None:
         creds = get_creds()
         access_token = creds.get("access_token")
-        if not access_token and creds.get("auth_mode") != "cert":
-            raise RuntimeError(f"Токен не получен от NGW. Ответ: {creds}")
+
+    # Обработка изображений в проекте остаётся токенной: для attachments/upload нужен Bearer-токен.
+    if not access_token:
+        raise RuntimeError(
+            "Для распознавания таблиц по изображению требуется Bearer access_token (OAuth). "
+            "Настройте GIGA_ACCESS_KEY/NGW, либо передайте access_token явно."
+        )
 
     model = model or TABLE_MODEL
     temperature = temperature if temperature is not None else TABLE_TEMPERATURE
@@ -116,7 +128,8 @@ def parse_table_from_image(
         headers_base=headers,
         access_token=access_token,
         json_payload=payload,
-        timeout=180,  # таблицы могут быть большими
+        timeout=GIGA_TABLE_TIMEOUT,  # таблицы могут быть большими
+        force_token_auth=True,
     )
 
     resp.raise_for_status()
@@ -202,6 +215,12 @@ def parse_table_interactive(
     if access_token is None:
         creds = get_creds()
         access_token = creds.get("access_token")
+
+    if not access_token:
+        raise RuntimeError(
+            "Интерактивный разбор таблицы требует Bearer access_token (OAuth), "
+            "потому что использует загрузку изображения/attachments."
+        )
 
     # Шаг 1: Общее описание
     print("Анализирую изображение...")

@@ -336,12 +336,13 @@ def run_pipeline(pdf_dir: Path, out_root: Path, mode: str = "full") -> None:
     """
     creds = get_creds()
     access_token = creds.get("access_token")
-    # cert-mode: токена может не быть
-    if not access_token and creds.get("auth_mode") != "cert":
+    # Пайплайн всегда работает с изображениями (OCR/attachments), поэтому тут нужен токен.
+    # mTLS в проекте используется только для текстовых запросов.
+    if not access_token:
         raise RuntimeError(
             f"Токен не получен от NGW. Ответ: {creds}. "
-            "Проверьте переменную окружения GIGA_ACCESS_KEY и доступ к NGW "
-            "или настройте mTLS (GIGA_CLIENT_CERT/KEY/CA_BUNDLE)."
+            "Для обработки изображений требуется Bearer access_token (OAuth): "
+            "проверьте GIGA_ACCESS_KEY и доступ к NGW."
         )
 
     pdf_dir = pdf_dir.resolve()

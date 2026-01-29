@@ -24,8 +24,10 @@ GIGA_NGW_URL=https://ngw.devices.sberbank.ru:9443/api/v2/oauth
 # mTLS (client certificates) — опционально
 ########################################
 
-# Путь к клиентскому сертификату (PEM). Если задан — запросы будут выполняться с mTLS.
-# В cert-режиме запросы сначала пробуются БЕЗ Bearer-токена; при 401/403 и наличии токена — повторяются с Bearer.
+# Путь к клиентскому сертификату (PEM).
+# ВАЖНО: в этом проекте mTLS используется ТОЛЬКО для текстовых запросов (chat/completions без attachments).
+# Обработка изображений (upload /files и мультимодальные запросы с attachments) выполняется ТОЛЬКО по Bearer-токену.
+# Для текста (cert-режим) запросы сначала пробуются БЕЗ Bearer-токена; при 401/403 и наличии токена — повторяются с Bearer.
 GIGA_CLIENT_CERT=/path/to/client-cert.pem
 
 # Путь к приватному ключу (PEM). Можно не задавать, если cert и key в одном PEM.
@@ -50,6 +52,29 @@ GIGA_CHAT_COMPLETIONS_URL=https://gigachat.devices.sberbank.ru/api/v1/chat/compl
 
 # Эндпоинт для загрузки файлов (изображений) в хранилище
 GIGA_CHAT_FILES_URL=https://gigachat.devices.sberbank.ru/api/v1/files
+
+
+########################################
+# Таймауты (секунды)
+########################################
+
+# Таймаут запроса к NGW (OAuth)
+GIGA_NGW_TIMEOUT=60
+
+# Таймауты для текстовых запросов к chat/completions
+GIGA_REQUEST_TIMEOUT=120
+
+# Таймауты для upload /files
+GIGA_FILES_TIMEOUT=120
+
+# Таймауты для мультимодального OCR (attachments)
+GIGA_OCR_TIMEOUT=120
+
+# Таймауты для распознавания таблиц
+GIGA_TABLE_TIMEOUT=180
+
+# Можно задать connect/read отдельно: "5,120"
+# пример: GIGA_REQUEST_TIMEOUT=5,120
 
 
 ########################################

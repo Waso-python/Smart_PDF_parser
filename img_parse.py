@@ -18,13 +18,46 @@ GIGA_CHAT_SCOPE = os.getenv("GIGA_CHAT_SCOPE", "GIGACHAT_API_CORP")
 
 # ---------- mTLS / сертификаты (опционально) ----------
 # Если указаны сертификаты, то запросы выполняются с client-certificate (mTLS).
-# При наличии сертификатов мы СНАЧАЛА пробуем выполнить запрос без Bearer-токена,
-# и только при 401/403 (и наличии access_token) повторяем запрос с Authorization.
+# ВАЖНО: в этом проекте mTLS используется ТОЛЬКО для текстовых запросов.
+# Обработка изображений/файлов (upload /files, attachments) остаётся ТОЛЬКО токенной.
+# Для текста: сначала пробуем запрос без Bearer-токена, и только при 401/403 (и наличии access_token)
+# повторяем запрос с Authorization.
 GIGA_CLIENT_CERT = (os.getenv("GIGA_CLIENT_CERT") or "").strip()
 GIGA_CLIENT_KEY = (os.getenv("GIGA_CLIENT_KEY") or "").strip()
 GIGA_CA_BUNDLE = (os.getenv("GIGA_CA_BUNDLE") or "").strip()
 GIGA_TLS_VERIFY = (os.getenv("GIGA_TLS_VERIFY", "0") or "").strip().lower() in ("1", "true", "yes", "on")
 GIGA_FORCE_TOKEN_AUTH = (os.getenv("GIGA_FORCE_TOKEN_AUTH", "0") or "").strip().lower() in ("1", "true", "yes", "on")
+
+# ---------- Таймауты (секунды) ----------
+def _parse_timeout(value: str | None, default: float) -> float | tuple[float, float]:
+    """
+    Поддержка форматов:
+    - "120" -> 120.0
+    - "5,120" -> (connect=5.0, read=120.0)
+    """
+    if value is None:
+        return float(default)
+    text = str(value).strip()
+    if not text:
+        return float(default)
+    if "," in text:
+        parts = [p.strip() for p in text.split(",") if p.strip()]
+        if len(parts) == 2:
+            try:
+                return (float(parts[0]), float(parts[1]))
+            except ValueError:
+                return float(default)
+    try:
+        return float(text)
+    except ValueError:
+        return float(default)
+
+
+GIGA_NGW_TIMEOUT = _parse_timeout(os.getenv("GIGA_NGW_TIMEOUT"), 60.0)
+GIGA_REQUEST_TIMEOUT = _parse_timeout(os.getenv("GIGA_REQUEST_TIMEOUT"), 120.0)
+GIGA_FILES_TIMEOUT = _parse_timeout(os.getenv("GIGA_FILES_TIMEOUT"), 120.0)
+GIGA_OCR_TIMEOUT = _parse_timeout(os.getenv("GIGA_OCR_TIMEOUT"), 120.0)
+GIGA_TABLE_TIMEOUT = _parse_timeout(os.getenv("GIGA_TABLE_TIMEOUT"), 180.0)
 
 # эндпоинт NGW для получения токена
 NGW_URL = os.getenv(
@@ -130,29 +163,41 @@ def _post_with_optional_token(
     json_payload: dict | None = None,
     data_payload: dict | None = None,
     files_payload: dict | None = None,
-    timeout: int = 120,
+    timeout: float | tuple[float, float] | None = None,
+    force_token_auth: bool = False,
 ) -> requests.Response:
     """
     Логика приоритета:
-    - если указаны client-сертификаты: сначала пробуем запрос БЕЗ Authorization
-      (cert-auth), а если получили 401/403 и есть access_token — повторяем с Bearer.
+    - ТЕКСТ: если указаны client-сертификаты, можно выполнять запросы БЕЗ Authorization
+      (cert-auth). При 401/403 и наличии access_token — повторяем с Bearer.
+    - КАРТИНКИ/ФАЙЛЫ: всегда требуем Bearer-токен (force_token_auth=True),
+      чтобы обработка изображений оставалась токенной.
     - если сертификатов нет: работаем только по токену (Authorization обязателен).
     """
     has_cert = bool(GIGA_CLIENT_CERT)
     headers_token = dict(headers_base)
-    if access_token:
-        headers_token["Authorization"] = f"Bearer {access_token}"
+    token = (str(access_token).strip() if access_token else "")
+    if token:
+        headers_token["Authorization"] = f"Bearer {token}"
 
-    if not has_cert and not access_token:
+    if (force_token_auth or GIGA_FORCE_TOKEN_AUTH) and not token:
+        raise RuntimeError(
+            "Для этого запроса требуется Bearer access_token (OAuth). "
+            "Обработка изображений/файлов в этом проекте выполняется только по токену."
+        )
+
+    if not has_cert and not token:
         raise RuntimeError(
             "Не задан access_token, а client-сертификаты не настроены. "
             "Либо настройте OAuth (GIGA_ACCESS_KEY), либо mTLS (GIGA_CLIENT_CERT/KEY)."
         )
 
+    if timeout is None:
+        timeout = GIGA_REQUEST_TIMEOUT
     kwargs = _transport_kwargs()
 
     # 1) cert-first
-    if has_cert and not GIGA_FORCE_TOKEN_AUTH:
+    if has_cert and not (GIGA_FORCE_TOKEN_AUTH or force_token_auth):
         resp = requests.post(
             url,
             headers=headers_base,
@@ -204,7 +249,7 @@ def get_creds() -> dict:
         headers["Authorization"] = f"Bearer {GIGA_CHAT_AUTH_DATA}"
     data = {"scope": GIGA_CHAT_SCOPE}
 
-    r = requests.post(NGW_URL, headers=headers, data=data, timeout=60, **_transport_kwargs())
+    r = requests.post(NGW_URL, headers=headers, data=data, timeout=GIGA_NGW_TIMEOUT, **_transport_kwargs())
     json_response = json.loads(r.text)
     json_response.setdefault("auth_mode", "token")
     return json_response
@@ -239,7 +284,8 @@ def upload_image_to_files(path: str, access_token: str | None) -> str:
             access_token=access_token,
             files_payload=files,
             data_payload=data,
-            timeout=120,
+            timeout=GIGA_FILES_TIMEOUT,
+            force_token_auth=True,
         )
 
     # Отдельно обрабатываем 400, чтобы увидеть текст ошибки от GigaChat и не падать трассировкой
@@ -320,7 +366,7 @@ def giga_free_answer(
         headers_base=headers,
         access_token=access_token,
         json_payload=payload,
-        timeout=120,
+        timeout=GIGA_REQUEST_TIMEOUT,
     )
 
     try:
@@ -393,7 +439,8 @@ def ocr_instruction_via_rest(
         headers_base=headers,
         access_token=access_token,
         json_payload=payload,
-        timeout=120,
+        timeout=GIGA_OCR_TIMEOUT,
+        force_token_auth=True,
     )
 
     # Обработка ошибок HTTP (в т.ч. 413 и 400)
@@ -447,35 +494,44 @@ def main():
     creds = get_creds()
     print("Ответ от NGW:", creds)
 
-    GIGA_ACCESS_TOKEN = creds.get("access_token")
-    GIGA_EXPIRES_AT = creds.get("expires_at")
+    auth_mode = str(creds.get("auth_mode") or "token")
+    access_token = creds.get("access_token")
+    expires_at = creds.get("expires_at")
 
-    if not GIGA_ACCESS_TOKEN:
+    # cert-mode: токена может не быть — работаем через mTLS (client certificates)
+    if not access_token and auth_mode == "cert":
+        print("Режим авторизации: mTLS (client certificates). Bearer-токен не используется.")
+        access_token = None
+    elif not access_token:
         print("Токен не получен! Код/сообщение от NGW:", creds.get("code"), creds.get("message"))
-        return
+        return  # дальше GigaChat вызывать нельзя (если нет mTLS)
 
-    if GIGA_EXPIRES_AT:
-        date = datetime.datetime.fromtimestamp(int(GIGA_EXPIRES_AT) // 1000)
+    if expires_at:
+        date = datetime.datetime.fromtimestamp(int(expires_at) // 1000)
         print("Access Token истекает - ", date)
     else:
         print("Поле 'expires_at' отсутствует или пустое, пропускаю расчёт даты")
 
     # 1. Пример обычного текстового запроса (как раньше)
     question = "не могу рассчитать риск сегмент"
-    answer = giga_free_answer(question, GIGA_ACCESS_TOKEN)
+    answer = giga_free_answer(question, access_token)
     print(f"answer (text) - {answer}")
 
     # 2. Пример распознавания инструкции по скрину
-    image_path = "123.jpg"  # сюда положи скрин/фото инструкции
-    try:
-        description = ocr_instruction_via_rest(image_path, GIGA_ACCESS_TOKEN)
-    except ValueError as e:
-        # Ловим ошибки сжатия/размера изображения и выводим аккуратное сообщение без трассировки
-        print(str(e))
-        return
+    # Обработка изображений в проекте остаётся токенной: без access_token этот пример пропускаем.
+    if access_token:
+        image_path = "123.jpg"  # сюда положи скрин/фото инструкции
+        try:
+            description = ocr_instruction_via_rest(image_path, access_token)
+        except ValueError as e:
+            # Ловим ошибки сжатия/размера изображения и выводим аккуратное сообщение без трассировки
+            print(str(e))
+            return
 
-    print("\nПодробное описание инструкции по изображению:\n")
-    print(description)
+        print("\nПодробное описание инструкции по изображению:\n")
+        print(description)
+    else:
+        print("Пример OCR по изображению пропущен: для него требуется Bearer access_token (OAuth).")
 
 
 if __name__ == "__main__":
