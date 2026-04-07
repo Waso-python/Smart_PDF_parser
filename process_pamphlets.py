@@ -12,7 +12,39 @@ except ImportError as e:
     ) from e
 
 from img_parse import get_creds, giga_free_answer, ocr_instruction_via_rest, get_token_stats
+from generate_faq import generate_faq_rows_for_pages, _build_doc_context
+from openpyxl import Workbook
 
+
+def _source_line(pamphlet_name: str, page_num: int) -> str:
+    safe_name = (pamphlet_name or "document").replace('"', "'").strip()
+    return f'[SOURCE - "{safe_name} - {page_num:03d}"]'
+
+
+def stage2_build_instruction_for_page_ocr_only(
+    image_path: Path,
+    access_token: str | None,
+    pamphlet_name: str,
+    page_num: int,
+    model: str | None = None,
+    temperature: float | None = None,
+) -> str:
+    """
+    Режим OCR-only:
+      - один мультимодальный вызов (ocr_instruction_via_rest)
+      - instruction.txt = OCR-текст + строка источника
+    Без merge.
+    """
+    ocr_text = ocr_instruction_via_rest(
+        str(image_path),
+        access_token,
+        model=model,
+        temperature=temperature,
+    ).strip()
+    src = _source_line(pamphlet_name, page_num)
+    if ocr_text:
+        return f"{ocr_text}\n\n{src}\n"
+    return f"{src}\n"
 
 def stage1_extract_pages(pdf_path: Path, out_root: Path) -> List[Dict]:
     """
@@ -60,6 +92,8 @@ def stage2_build_instruction_for_page(
     text_path: Path,
     image_path: Path,
     access_token: str,
+    model: str | None = None,
+    temperature: float | None = None,
 ) -> str:
     """
     Этап 2.
@@ -69,41 +103,61 @@ def stage2_build_instruction_for_page(
     Возвращаем итоговую инструкцию как строку.
     """
     # 2.1. Получаем описание по скриншоту (мультимодальный вызов)
-    ocr_description = ocr_instruction_via_rest(str(image_path), access_token)
+    ocr_description = ocr_instruction_via_rest(
+        str(image_path),
+        access_token,
+        model=model,
+        temperature=temperature,
+    )
 
     # 2.2. Читаем текстовый слой страницы
     text_layer = text_path.read_text(encoding="utf-8")
 
-    # 2.3. Формируем запрос на объединение
+    # 2.3. Формируем запрос на объединение (приоритет: текстовый слой)
     merge_question = (
         "У тебя есть две версии ОДНОЙ И ТОЙ ЖЕ страницы инструкции по работе в АС.\n\n"
-        "Первая версия – текстовый слой страницы (из PDF):\n"
+        "ВЕРСИЯ A (АВТОРИТЕТНАЯ): текстовый слой страницы (из PDF).\n"
+        "Это основной источник истины: он должен определять формулировки, порядок и содержание.\n"
         "----------------------------------------\n"
         f"{text_layer}\n"
         "----------------------------------------\n\n"
-        "Вторая версия – текст, полученный по скриншоту той же страницы:\n"
+        "ВЕРСИЯ B (ВСПОМОГАТЕЛЬНАЯ): текст, полученный OCR по скриншоту той же страницы.\n"
+        "OCR может содержать мусор (артефакты, обрывки UI-обвязки, водяные знаки, ошибки распознавания).\n"
+        "Используй OCR ТОЛЬКО как подсказку для восстановления явно ПРОПУЩЕННЫХ фрагментов, "
+        "если они отсутствуют в версии A, но хорошо читаются в версии B.\n"
         "----------------------------------------\n"
         f"{ocr_description}\n"
         "----------------------------------------\n\n"
-        "Твоя задача — сделать один аккуратный, объединённый текст этой САМОЙ страницы.\n\n"
-        "Строгие правила:\n"
-        "1) НЕЛЬЗЯ придумывать ни одного нового шага, пункта, кнопки, предупреждения или общего совета, "
+        "Твоя задача — сделать один аккуратный итоговый текст этой страницы.\n\n"
+        "Строгие правила (критично):\n"
+        "1) ПРИОРИТЕТ: если версия A содержит фразу/пункт, а версия B отличается или противоречит — "
+        "ВСЕГДА выбирай версию A. Не «улучшай» и не переписывай по OCR.\n"
+        "2) OCR-добавления разрешены ТОЛЬКО если:\n"
+        "   - в версии A есть очевидный пропуск/пустое место/обрыв строки, и\n"
+        "   - в версии B этот же фрагмент читается ясно, и\n"
+        "   - добавление не похоже на UI-обвязку/шум/водяной знак/служебный текст.\n"
+        "   Если есть сомнение — НЕ добавляй.\n"
+        "3) АНТИ-МУСОР: не включай в итоговый текст элементы интерфейса/просмотрщика/браузера "
+        "(меню, табы, кнопки «ОК/Отмена/Назад/Далее/Сохранить/Закрыть», навигацию, пагинацию, системные статусы), "
+        "водяные знаки (demo/sample/test) и прочие посторонние надписи, даже если OCR их распознал.\n"
+        "4) НЕЛЬЗЯ придумывать ни одного нового шага, кнопки, поля, предупреждения или общего совета, "
         "если он явно не присутствует хотя бы в одной из двух версий.\n"
-        "2) НЕЛЬЗЯ добавлять общие фразы вроде «обратитесь в справку/техподдержку», "
-        "если они прямо не написаны в исходных текстах.\n"
-        "3) Можно:\n"
+        "5) Можно:\n"
         "   - убирать повторы;\n"
-        "   - исправлять явные артефакты OCR;\n"
-        "   - немного переформулировать фразы, НЕ меняя смысл и не расширяя его.\n"
-        "4) Каждый факт и каждое действие в итоговом тексте должно быть дословно или почти дословно "
-        "обосновано хотя бы одной из двух версий сверху.\n"
-        "5) Если информации мало, просто перепиши её аккуратно и ничего не добавляй.\n"
+        "   - исправлять переносы строк/дефисы и типографику;\n"
+        "   - исправлять явные артефакты OCR (но НЕ переносить OCR-ошибки в итог).\n"
+        "6) Итог должен быть максимально близок к версии A по содержанию. "
+        "Верни ТОЛЬКО итоговый текст страницы, без комментариев и без разделов «A/B».\n"
     )
 
     sys_prompt_merge = (
         "Ты опытный методолог и сотрудник кредитного отдела банка. "
-        "Твоя задача — строго и аккуратно объединять несколько версий одной и той же инструкции "
-        "в единый текст БЕЗ добавления новых смыслов. "
+        "Твоя задача — строго и аккуратно объединять несколько версий одной и той же страницы "
+        "в единый текст БЕЗ добавления новых смыслов.\n"
+        "Критично: версия A (текстовый слой PDF) — авторитетная. "
+        "Версия B (OCR) — только вспомогательная, её легко загрязняет шум. "
+        "Если есть конфликт — выбирай версию A. "
+        "OCR используй только для восстановления явных пропусков в версии A.\n"
         "Любая фраза, которой нет в исходных текстах, считается ошибкой. "
         "Не придумывай примеры, рекомендации, служебные фразы и дополнительный функционал."
     )
@@ -112,6 +166,9 @@ def stage2_build_instruction_for_page(
         question=merge_question,
         access_token=access_token,
         sys_prompt=sys_prompt_merge,
+        model=model,
+        # Для merge держим температуру максимально низкой: меньше «креативности» и меньше заноса OCR-мусора.
+        temperature=0.0 if temperature is None else temperature,
     )
 
     return merged_instruction
@@ -145,126 +202,19 @@ def stage3_merge_pdf_instructions(pdf_dir: Path) -> Path:
     return merged_path
 
 
-def stage4_build_incremental_context(pdf_dir: Path, access_token: str) -> Path:
-    """
-    Этап 4.
-    Инкрементально наращиваем «смысл» инструкции по мере чтения страниц:
-      - для страницы 1 контекст = её инструкция;
-      - для каждой следующей страницы учитываем уже собранный контекст + текущую инструкцию;
-      - работаем ТОЛЬКО с текстом (instruction.txt), без картинок.
-
-    На выходе:
-      - по каждой странице: instruction_with_context.txt (контекст до этой страницы включительно);
-      - общий файл: instructions_incremental.md с полной инструкцией по документу.
-    """
-    page_dirs = sorted(
-        [p for p in pdf_dir.iterdir() if p.is_dir() and p.name.startswith("page_")]
-    )
-
-    if not page_dirs:
-        return pdf_dir / "instructions_incremental.md"
-
-    sys_prompt_incremental = (
-        "Ты опытный методолог и сотрудник кредитного отдела банка. "
-        "Ты собираешь единую подробную инструкцию по работе в АС из нескольких страниц.\n"
-        "- Ты НИКОГДА не придумываешь новых шагов, сценариев, кнопок или рекомендаций,\n"
-        "  которых нет в текстах страниц.\n"
-        "- Твоя особенность — ты всегда помечаешь каждый смысловой элемент тегом источника "
-        "вида [SOURCE: page XXX], где XXX — номер страницы, на которой этот элемент появился.\n"
-        "- Ты можешь только:\n"
-        "  * объединять и упорядочивать уже имеющиеся шаги;\n"
-        "  * убирать повторы;\n"
-        "  * НЕ менять смысл уже существующих элементов.\n"
-        "- Любая новая идея, не подтверждённая текстом страниц, считается ошибкой."
-    )
-
-    combined_text: str | None = None
-
-    for idx, page_dir in enumerate(page_dirs, start=1):
-        instr_path = page_dir / "instruction.txt"
-        if not instr_path.exists():
-            continue
-        page_text = instr_path.read_text(encoding="utf-8").strip()
-        if not page_text:
-            continue
-
-        if combined_text is None:
-            # Первая страница — формируем элементы сразу с тегами источника
-            question = (
-                f"Перед тобой текст страницы №{idx} инструкции по работе в АС:\n"
-                "----------------------------------------\n"
-                f"{page_text}\n"
-                "----------------------------------------\n\n"
-                "Сформируй список смысловых элементов (шаги, правила, предупреждения, заголовки разделов) "
-                "только по этому тексту.\n\n"
-                "Требования к формату:\n"
-                f"- каждый элемент пиши с новой строки;\n"
-                f"- в КОНЦЕ каждого смыслового блока добавь тег вида [SOURCE: page {idx:03d}];\n"
-                "- не добавляй информацию, которой нет в тексте страницы.\n"
-                "- не добавляй никакие пояснения, комментарии или примеры от себя."
-            )
-
-            combined_text = giga_free_answer(
-                question=question,
-                access_token=access_token,
-                sys_prompt=sys_prompt_incremental,
-            )
-        else:
-            # Инкрементальное уточнение/расширение с учётом новой страницы
-            question = (
-                f"У тебя уже есть собранная инструкция по страницам 1–{idx-1} "
-                "с тегами источников [SOURCE: page XXX]:\n"
-                "----------------------------------------\n"
-                f"{combined_text}\n"
-                "----------------------------------------\n\n"
-                f"И есть текст новой страницы №{idx}:\n"
-                "----------------------------------------\n"
-                f"{page_text}\n"
-                "----------------------------------------\n\n"
-                "Обнови общую инструкцию так, чтобы она отражала страницы 1–"
-                f"{idx} включительно.\n\n"
-                "Строгие правила:\n"
-                "1) НЕ удаляй и НЕ изменяй существующие строки и их теги [SOURCE: page ...], "
-                "можно только добавлять новые строки.\n"
-                "2) Для новых смысловых элементов, которые появляются только на странице "
-                f"№{idx}, добавляй строки с тегом [SOURCE: page {idx:03d}].\n"
-                "3) НЕЛЬЗЯ придумывать новые функции, кнопки, шаги или рекомендации, "
-                "если их нет ни в одной из страниц.\n"
-                "4) Если новая страница почти ничего не добавляет, можешь вернуть текст почти "
-                "без изменений.\n"
-                "5) Верни только итоговый текст инструкции с тегами, без пояснений и комментариев."
-            )
-
-            combined_text = giga_free_answer(
-                question=question,
-                access_token=access_token,
-                sys_prompt=sys_prompt_incremental,
-            )
-
-        # Сохраняем контекст до текущей страницы включительно
-        ctx_path = page_dir / "instruction_with_context.txt"
-        ctx_path.write_text(combined_text, encoding="utf-8")
-
-    # Итоговый файл по всему документу
-    incremental_path = pdf_dir / "instructions_incremental.md"
-    if combined_text is None:
-        incremental_path.write_text("", encoding="utf-8")
-    else:
-        incremental_path.write_text(combined_text, encoding="utf-8")
-
-    return incremental_path
-
-
-def run_pipeline(pdf_dir: Path, out_root: Path) -> None:
+def run_pipeline(pdf_dir: Path, out_root: Path, mode: str = "full") -> None:
     """
     Запускает все три этапа пайплайна для всех PDF в указанном каталоге.
     """
     creds = get_creds()
     access_token = creds.get("access_token")
+    # Пайплайн всегда работает с изображениями (OCR/attachments), поэтому тут нужен токен.
+    # mTLS в проекте используется только для текстовых запросов.
     if not access_token:
         raise RuntimeError(
             f"Токен не получен от NGW. Ответ: {creds}. "
-            "Проверьте переменную окружения GIGA_ACCESS_KEY и доступ к NGW."
+            "Для обработки изображений требуется Bearer access_token (OAuth): "
+            "проверьте GIGA_ACCESS_KEY и доступ к NGW."
         )
 
     pdf_dir = pdf_dir.resolve()
@@ -292,11 +242,19 @@ def run_pipeline(pdf_dir: Path, out_root: Path) -> None:
 
             print(f"Этап 2: страница {page_num} ({page_dir})")
             try:
-                instruction = stage2_build_instruction_for_page(
-                    text_path=text_path,
-                    image_path=image_path,
-                    access_token=access_token,
-                )
+                if mode == "ocr_only":
+                    instruction = stage2_build_instruction_for_page_ocr_only(
+                        image_path=image_path,
+                        access_token=access_token,
+                        pamphlet_name=pdf_path.stem,
+                        page_num=page_num,
+                    )
+                else:
+                    instruction = stage2_build_instruction_for_page(
+                        text_path=text_path,
+                        image_path=image_path,
+                        access_token=access_token,
+                    )
             except ValueError as e:
                 # Ошибки размера/загрузки/валидации обрабатываем мягко, но логируем
                 print(f"  Ошибка при обработке страницы {page_num}: {e}")
@@ -310,9 +268,41 @@ def run_pipeline(pdf_dir: Path, out_root: Path) -> None:
         merged_path = stage3_merge_pdf_instructions(pdf_out_dir)
         print(f"Этап 3: итоговый документ (страницы по отдельности): {merged_path}")
 
-        # Этап 4: инкрементальное накопление смысла по страницам
-        incremental_path = stage4_build_incremental_context(pdf_out_dir, access_token)
-        print(f"Этап 4: итоговый документ с накопленным контекстом: {incremental_path}")
+        # Этап 4 (опционально): FAQ в Excel по всем страницам
+        if os.getenv("GENERATE_FAQ_XLSX", "0") == "1":
+            print("Этап 5: генерация FAQ (Excel) по всем страницам...")
+            merged_text = merged_path.read_text(encoding="utf-8") if merged_path.exists() else ""
+            doc_ctx = _build_doc_context(merged_text, max_chars=12000)
+
+            pages_for_faq = []
+            for info in page_infos:
+                page_num = info["page_num"]
+                instr_path = info["dir"] / "instruction.txt"
+                if instr_path.exists():
+                    pages_for_faq.append((page_num, instr_path.read_text(encoding="utf-8")))
+
+            rows = generate_faq_rows_for_pages(
+                pages=pages_for_faq,
+                full_doc_context=doc_ctx,
+                access_token=access_token,
+                pamphlet_name=pdf_path.stem,
+                output_tokens=int(os.getenv("FAQ_OUTPUT_TOKENS", "10000")),
+            )
+
+            # XLSX
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "FAQ"
+            ws.append(["Вопрос", "Ответ", "Источник"])
+            for r in rows:
+                ws.append([r.get("question", ""), r.get("answer", ""), r.get("source", "")])
+            ws.column_dimensions["A"].width = 60
+            ws.column_dimensions["B"].width = 90
+            ws.column_dimensions["C"].width = 40
+
+            faq_xlsx_path = pdf_out_dir / f"{pdf_path.stem}_faq.xlsx"
+            wb.save(faq_xlsx_path)
+            print(f"Этап 5: FAQ сохранён: {faq_xlsx_path}")
 
     # После обработки всех PDF выводим суммарное потребление токенов
     stats = get_token_stats()
@@ -329,7 +319,7 @@ def main() -> None:
         description=(
             "Пайплайн обработки памяток по работе в АС:\n"
             "1) Разбиение PDF на страницы (текст + скриншот); "
-            "2) Обработка скриншотов через GigaChat и объединение с текстовым слоем; "
+            "2) Обработка страниц через GigaChat (full: OCR+merge / ocr_only: только OCR); "
             "3) Склейка итоговых инструкций в один документ."
         )
     )
@@ -347,9 +337,16 @@ def main() -> None:
         help="Каталог, куда складывать результаты пайплайна.",
 		default="out",
     )
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="full",
+        choices=["full", "ocr_only"],
+        help="Режим обработки: full = OCR+merge; ocr_only = только OCR (instruction.txt из OCR + SOURCE).",
+    )
 
     args = parser.parse_args()
-    run_pipeline(pdf_dir=Path(args.pdf_dir), out_root=Path(args.out_dir))
+    run_pipeline(pdf_dir=Path(args.pdf_dir), out_root=Path(args.out_dir), mode=args.mode)
 
 
 if __name__ == "__main__":

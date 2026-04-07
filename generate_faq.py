@@ -4,10 +4,17 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 from img_parse import get_creds, giga_free_answer, get_token_stats
+from openpyxl import Workbook
 
 
 PAGE_HEADER_RE = re.compile(r"^##\s*Страница\s+(\d+)\s*$", re.MULTILINE)
 SOURCE_TAG_RE = re.compile(r"\[SOURCE:\s*page\s*(\d{1,3})\s*\]", re.IGNORECASE)
+FAQ_BLOCK_RE = re.compile(
+    r"ВОПРОС:\s*(?P<q>.*?)(?:\r?\n)+"
+    r"(?:ОТВЕТ|ИНСТРУКЦИЯ):\s*(?P<a>.*?)(?:\r?\n)+"
+    r"\[SOURCE\s*-\s*\"(?P<s>.*?)\"\]\s*",
+    re.DOTALL | re.IGNORECASE,
+)
 
 
 def _split_by_page_headers(md: str) -> List[Tuple[int, str]]:
@@ -33,7 +40,7 @@ def _split_by_page_headers(md: str) -> List[Tuple[int, str]]:
 
 def _group_lines_by_source_tags(md: str) -> Dict[int, List[str]]:
     """
-    Парсинг формата instructions_incremental.md:
+    Парсинг формата с тегами источников:
     каждая смысловая строка содержит [SOURCE: page XXX]
     """
     groups: Dict[int, List[str]] = {}
@@ -59,6 +66,38 @@ def _build_doc_context(md: str, max_chars: int = 8000) -> str:
     return md[:max_chars] + "\n\n[...ОБРЕЗАНО...]\n"
 
 
+def _parse_faq_blocks(text: str) -> List[Dict[str, str]]:
+    """
+    Парсим ответы модели в блоках:
+      ВОПРОС: ...
+      ОТВЕТ/ИНСТРУКЦИЯ: ...
+      [SOURCE - "..."]
+    """
+    items: List[Dict[str, str]] = []
+    for m in FAQ_BLOCK_RE.finditer(text.strip()):
+        q = m.group("q").strip()
+        a = m.group("a").strip()
+        s = m.group("s").strip()
+        if q and a and s:
+            items.append({"question": q, "answer": a, "source": s})
+    return items
+
+
+def _rows_to_xlsx(rows: List[Dict[str, str]], out_path: Path) -> None:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "FAQ"
+    ws.append(["Вопрос", "Ответ", "Источник"])
+    for r in rows:
+        ws.append([r.get("question", ""), r.get("answer", ""), r.get("source", "")])
+
+    # Немного авто-ширины (ограниченно)
+    for col, width in (("A", 60), ("B", 90), ("C", 40)):
+        ws.column_dimensions[col].width = width
+
+    wb.save(out_path)
+
+
 def generate_faq_for_pages(
     pages: List[Tuple[int, str]],
     full_doc_context: str,
@@ -80,6 +119,21 @@ def generate_faq_for_pages(
         "но не добавляй сущности, которых нет.\n"
         "- В ответах будь подробным, но без домыслов: только то, что следует из текста.\n"
         "- Формат ответа СТРОГО задан ниже, без лишних комментариев.\n"
+        "- ВАЖНО: если страница содержит ТОЛЬКО название/заголовок раздела без содержательной информации "
+        "(титульный слайд, разделитель глав, только заголовок и т.п.), то НЕ генерируй вопросы. "
+        "В таком случае верни ТОЛЬКО слово: НЕТ_КОНТЕНТА\n\n"
+        "КРИТИЧНО ДЛЯ RAG-ПОИСКА:\n"
+        "- Вопросы будут использоваться для поиска по базе знаний, где много разных инструкций.\n"
+        "- ОБЯЗАТЕЛЬНО определи из текста страницы ПРЕДМЕТНЫЙ КОНТЕКСТ: название АС, модуля, экрана, "
+        "процесса, продукта, формы — всё, что уникально идентифицирует тему страницы.\n"
+        "- Включай этот контекст В КАЖДЫЙ ВОПРОС.\n"
+        "- ЗАПРЕЩЕНЫ общие формулировки без контекста: «Как создать заявку?», «Какие поля заполнить?», "
+        "«Что делать при ошибке?» — такие вопросы одинаковы для разных инструкций и бесполезны для поиска.\n"
+        "- ПРАВИЛЬНО: «Как создать заявку на рефинансирование в АС Кредит-Онлайн?», "
+        "«Какие поля заполнить в карточке клиента модуля Скоринг?», «Что делать при ошибке валидации в форме КИ?»\n"
+        "- Вопрос должен быть самодостаточным: читая только вопрос (без ответа), должно быть понятно, "
+        "о какой системе/процессе/модуле/экране идёт речь.\n"
+        "- НЕ используй название файла памятки в вопросах — используй ТОЛЬКО предметные термины из текста.\n"
     )
 
     out_chunks: List[str] = []
@@ -97,15 +151,45 @@ def generate_faq_for_pages(
             "----------------------------------------\n"
             f"{page_text}\n"
             "----------------------------------------\n\n"
-            "Сгенерируй 3–5 максимально продуманных элементов FAQ по этой странице.\n"
-            "Требования:\n"
-            "- вопросы должны быть практическими (что делать/как проверить/какие условия/какие статусы/что означает и т.п.);\n"
-            "- вопросы не должны повторяться по смыслу;\n"
-            "- вопросы должны учитывать контекст документа, но опираться на факты из текста страницы;\n"
-            "- используй профессиональный сленг, соответствующий банковским АС;\n\n"
-            "Формат ВЫВОДА (строго, повторить блок 3–5 раз):\n\n"
-            "ВОПРОС: <текст вопроса>\n\n"
-            "ИНСТРУКЦИЯ: <подробный ответ>\n\n"
+            "ВАЖНО: Сначала оцени, есть ли на этой странице содержательная информация.\n"
+            "Если страница содержит ТОЛЬКО:\n"
+            "- название/заголовок раздела,\n"
+            "- титульный слайд,\n"
+            "- разделитель глав,\n"
+            "- оглавление без деталей,\n"
+            "- или просто короткую фразу без инструкций/шагов/правил,\n"
+            "то верни ТОЛЬКО слово: НЕТ_КОНТЕНТА\n\n"
+            "Если же на странице есть содержательная информация (шаги, правила, описания полей, "
+            "условия, статусы, действия пользователя и т.п.), тогда:\n\n"
+            "ШАГ 1 — ОПРЕДЕЛИ ПРЕДМЕТНЫЙ КОНТЕКСТ страницы:\n"
+            "Найди в тексте страницы специфичные термины, которые уникально идентифицируют тему:\n"
+            "- название АС (например: АС «Кредит-Онлайн», ЕКП, ППРБ, СКБ, Siebel)\n"
+            "- название модуля/подсистемы (например: модуль Скоринг, блок КИ, подсистема Залоги)\n"
+            "- название экрана/формы (например: карточка клиента, форма заявки, экран сверки)\n"
+            "- название процесса/продукта (например: рефинансирование, ипотека, потребкредит)\n"
+            "Этот контекст ОБЯЗАТЕЛЕН в каждом вопросе.\n\n"
+            "ШАГ 2 — Сгенерируй от 3 до 8 элементов FAQ по этой странице.\n"
+            "Количество вопросов зависит от объёма информации на странице:\n"
+            "- мало информации (1-2 пункта/шага) → 3 вопроса;\n"
+            "- средний объём (3-5 пунктов/шагов) → 4-5 вопросов;\n"
+            "- много информации (6+ пунктов, таблицы, несколько разделов) → 6-8 вопросов.\n"
+            "Не создавай лишних вопросов, если информации мало. Не упускай важное, если информации много.\n\n"
+            "Требования к ВОПРОСАМ (критично для RAG):\n"
+            "- Каждый вопрос ОБЯЗАН содержать ПРЕДМЕТНЫЙ КОНТЕКСТ из текста страницы "
+            "(название АС/модуля/экрана/процесса).\n"
+            "- ЗАПРЕЩЕНЫ общие формулировки без контекста:\n"
+            "  ПЛОХО: «Как создать заявку?»\n"
+            "  ХОРОШО: «Как создать заявку на рефинансирование в модуле Кредитный конвейер?»\n"
+            "  ПЛОХО: «Какие поля заполнить?»\n"
+            "  ХОРОШО: «Какие поля заполнить в карточке клиента АС Siebel при оформлении ипотеки?»\n"
+            "- НЕ используй название файла/памятки — только предметные термины из текста.\n"
+            "- Вопрос должен быть самодостаточным: читая только вопрос, должно быть понятно, о чём речь.\n"
+            "- Вопросы должны быть практическими (что делать/как проверить/какие условия/какие статусы).\n"
+            "- Вопросы не должны повторяться по смыслу.\n"
+            "- Используй профессиональный сленг банковских АС.\n\n"
+            "Формат ВЫВОДА (строго, повторить блок от 3 до 8 раз в зависимости от объёма):\n\n"
+            "ВОПРОС: <текст вопроса С ПРЕДМЕТНЫМ КОНТЕКСТОМ из текста страницы>\n\n"
+            "ОТВЕТ: <подробный ответ>\n\n"
             f'[SOURCE - "{pamphlet_name} - {page_num:03d}"]\n\n'
             "Правила формата:\n"
             "- после строки [SOURCE - \"...\"] сразу начинается следующий блок или конец ответа;\n"
@@ -120,9 +204,35 @@ def generate_faq_for_pages(
             max_tokens=output_tokens,
         ).strip()
 
+        # Пропускаем страницы без содержательного контента (только заголовок/название раздела)
+        if faq.upper().startswith("НЕТ_КОНТЕНТА") or faq.upper() == "НЕТ КОНТЕНТА":
+            continue
+
         out_chunks.append(f"## FAQ — Страница {page_num:03d}\n\n{faq}\n")
 
     return "\n\n".join(out_chunks).strip() + "\n"
+
+
+def generate_faq_rows_for_pages(
+    pages: List[Tuple[int, str]],
+    full_doc_context: str,
+    access_token: str,
+    pamphlet_name: str,
+    output_tokens: int = 10000,
+) -> List[Dict[str, str]]:
+    """
+    Генерируем FAQ и возвращаем список строк для Excel:
+      {"question": "...", "answer": "...", "source": "..."}
+    """
+    md = generate_faq_for_pages(
+        pages=pages,
+        full_doc_context=full_doc_context,
+        access_token=access_token,
+        pamphlet_name=pamphlet_name,
+        output_tokens=output_tokens,
+    )
+    rows = _parse_faq_blocks(md)
+    return rows
 
 
 def main() -> None:
@@ -137,13 +247,13 @@ def main() -> None:
         "--md",
         type=str,
         required=True,
-        help="Путь к markdown-файлу (например out/<pdf>/instructions_merged.md или instructions_incremental.md).",
+        help="Путь к markdown-файлу (например out/<pdf>/instructions_merged.md).",
     )
     parser.add_argument(
         "--out",
         type=str,
         default="",
-        help="Путь к выходному файлу. По умолчанию создаётся рядом: <input>_faq.md",
+        help="Путь к выходному файлу. По умолчанию создаётся рядом: <input>_faq.xlsx",
     )
     parser.add_argument(
         "--pamphlet-name",
@@ -168,7 +278,8 @@ def main() -> None:
     # Авторизация
     creds = get_creds()
     access_token = creds.get("access_token")
-    if not access_token:
+    # cert-mode: токена может не быть
+    if not access_token and creds.get("auth_mode") != "cert":
         raise RuntimeError(f"Токен не получен от NGW. Ответ: {creds}")
 
     # Парсинг страниц: сначала пробуем формат с SOURCE-тегами, иначе — по заголовкам
@@ -196,7 +307,7 @@ def main() -> None:
         parent_name = in_path.parent.name
         pamphlet_name = parent_name if parent_name else in_path.stem
 
-    faq_md = generate_faq_for_pages(
+    rows = generate_faq_rows_for_pages(
         pages=pages,
         full_doc_context=doc_context,
         access_token=access_token,
@@ -204,9 +315,9 @@ def main() -> None:
         output_tokens=args.output_tokens,
     )
 
-    out_path = Path(args.out) if args.out else in_path.with_name(f"{in_path.stem}_faq.md")
-    out_path.write_text(faq_md, encoding="utf-8")
-    print(f"FAQ сохранён: {out_path}")
+    out_path = Path(args.out) if args.out else in_path.with_name(f"{in_path.stem}_faq.xlsx")
+    _rows_to_xlsx(rows, out_path)
+    print(f"FAQ (Excel) сохранён: {out_path}")
 
     stats = get_token_stats()
     print(

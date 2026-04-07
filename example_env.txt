@@ -21,6 +21,29 @@ GIGA_NGW_URL=https://ngw.devices.sberbank.ru:9443/api/v2/oauth
 
 
 ########################################
+# mTLS (client certificates) — опционально
+########################################
+
+# Путь к клиентскому сертификату (PEM).
+# ВАЖНО: в этом проекте mTLS используется ТОЛЬКО для текстовых запросов (chat/completions без attachments).
+# Обработка изображений (upload /files и мультимодальные запросы с attachments) выполняется ТОЛЬКО по Bearer-токену.
+# Для текста (cert-режим) запросы сначала пробуются БЕЗ Bearer-токена; при 401/403 и наличии токена — повторяются с Bearer.
+GIGA_CLIENT_CERT=/path/to/client-cert.pem
+
+# Путь к приватному ключу (PEM). Можно не задавать, если cert и key в одном PEM.
+GIGA_CLIENT_KEY=/path/to/client-key.pem
+
+# Путь к CA bundle (PEM) для проверки TLS-сертификата сервера (рекомендуется в промышленном контуре).
+GIGA_CA_BUNDLE=/path/to/ca-bundle.pem
+
+# Включить системную проверку TLS-сертификата сервера (если CA bundle не задан).
+GIGA_TLS_VERIFY=0
+
+# Принудительно использовать только Bearer-токен, даже если сертификаты заданы.
+GIGA_FORCE_TOKEN_AUTH=0
+
+
+########################################
 # Эндпоинты GigaChat API
 ########################################
 
@@ -32,6 +55,51 @@ GIGA_CHAT_FILES_URL=https://gigachat.devices.sberbank.ru/api/v1/files
 
 
 ########################################
+# Таймауты (секунды)
+########################################
+
+# Таймаут запроса к NGW (OAuth)
+GIGA_NGW_TIMEOUT=60
+
+# Таймауты для текстовых запросов к chat/completions
+GIGA_REQUEST_TIMEOUT=120
+
+# Таймауты для upload /files
+GIGA_FILES_TIMEOUT=120
+
+# Таймауты для мультимодального OCR (attachments)
+GIGA_OCR_TIMEOUT=120
+
+# Таймауты для распознавания таблиц
+GIGA_TABLE_TIMEOUT=180
+
+# Можно задать connect/read отдельно: "5,120"
+# пример: GIGA_REQUEST_TIMEOUT=5,120
+
+
+########################################
+# Startup healthcheck (Web UI)
+########################################
+
+# Проверка подключения к GigaChat при старте Web UI
+GIGA_STARTUP_CHECK=1
+
+# Если 1 — приложение упадёт при неуспешной проверке
+GIGA_STARTUP_FAIL=0
+
+
+########################################
+# Логирование (Web UI)
+########################################
+
+# Файл логов Web UI (по умолчанию out/web/web_ui.log)
+WEB_LOG_FILE=out/web/web_ui.log
+
+# Уровень логирования: DEBUG/INFO/WARNING/ERROR
+WEB_LOG_LEVEL=INFO
+
+
+########################################
 # Модели GigaChat
 ########################################
 
@@ -40,5 +108,23 @@ GIGA_TEXT_MODEL=GigaChat-2-Pro
 
 # Мультимодальная модель для OCR/анализа изображений (если отличается)
 GIGA_VISION_MODEL=GigaChat-2-Pro
+
+# Температуры (опционально)
+GIGA_TEXT_TEMPERATURE=0.01
+GIGA_VISION_TEMPERATURE=0.01
+
+# Секрет для Web UI (Flask)
+WEB_SECRET_KEY=change_me
+
+########################################
+# DOCX export (pandoc) — опционально
+########################################
+
+# Если pandoc не в PATH, укажите полный путь к бинарнику
+PANDOC_PATH=pandoc
+
+# Опционально: reference .docx для красивого стиля (шрифты/заголовки/таблицы)
+# Можно создать вручную в Word и передать сюда.
+PANDOC_REFERENCE_DOCX=/path/to/reference.docx
 
 

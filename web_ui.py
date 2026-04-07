@@ -1,0 +1,2246 @@
+import json
+import os
+import uuid
+import threading
+import subprocess
+import logging
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Any, Tuple
+from io import BytesIO
+
+import fitz  # PyMuPDF
+from dotenv import load_dotenv
+from flask import (
+    Flask,
+    request,
+    redirect,
+    url_for,
+    send_file,
+    abort,
+    render_template_string,
+    jsonify,
+)
+
+from img_parse import get_creds, get_token_stats, ocr_instruction_via_rest, giga_free_answer
+from generate_faq import generate_faq_for_pages, _build_doc_context
+from table_parser import parse_table_from_image
+from openpyxl import Workbook
+
+
+load_dotenv()
+
+# По умолчанию складываем результаты Web UI в out/web/, чтобы было видно рядом с CLI-пайплайном.
+APP_DATA_DIR = Path(os.getenv("WEB_DATA_DIR", "out/web")).resolve()
+APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
+JOBS_DIR = (APP_DATA_DIR / "_jobs").resolve()
+JOBS_DIR.mkdir(parents=True, exist_ok=True)
+
+LOGGER = logging.getLogger("web_ui")
+LOG_LOCK = threading.Lock()
+
+
+def _setup_logging() -> None:
+    with LOG_LOCK:
+        if LOGGER.handlers:
+            return
+        level_name = (os.getenv("WEB_LOG_LEVEL", "INFO") or "").strip().upper()
+        level = getattr(logging, level_name, logging.INFO)
+        LOGGER.setLevel(level)
+
+        log_path = os.getenv("WEB_LOG_FILE", str(APP_DATA_DIR / "web_ui.log"))
+        fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+
+        file_handler = logging.FileHandler(log_path, encoding="utf-8")
+        file_handler.setLevel(level)
+        file_handler.setFormatter(fmt)
+        LOGGER.addHandler(file_handler)
+
+        console = logging.StreamHandler()
+        console.setLevel(level)
+        console.setFormatter(fmt)
+        LOGGER.addHandler(console)
+
+        LOGGER.info("Логирование включено. Файл: %s", log_path)
+JOBS_LOCK = threading.Lock()
+JOB_THREADS: dict[str, threading.Thread] = {}
+
+
+def _doc_dir(doc_id: str) -> Path:
+    return APP_DATA_DIR / doc_id
+
+
+def _job_path(job_id: str) -> Path:
+    return JOBS_DIR / f"{job_id}.json"
+
+
+def _job_load(job_id: str) -> Dict[str, Any]:
+    p = _job_path(job_id)
+    if not p.exists():
+        return {}
+    return json.loads(p.read_text(encoding="utf-8"))
+
+
+def _job_save(job: Dict[str, Any]) -> None:
+    job_id = str(job.get("job_id", ""))
+    if not job_id:
+        return
+    p = _job_path(job_id)
+    # На другой машине/в контейнере каталог может отсутствовать (или быть удалён во время работы).
+    # Гарантируем наличие папки перед записью.
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(job, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _job_update(job_id: str, **fields: Any) -> Dict[str, Any]:
+    with JOBS_LOCK:
+        job = _job_load(job_id) or {"job_id": job_id}
+        job.update(fields)
+        _job_save(job)
+        return job
+
+
+def _new_job(job_type: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    job_id = str(uuid.uuid4())
+    job = {
+        "job_id": job_id,
+        "type": job_type,
+        "status": "running",  # running|done|error
+        "created_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "updated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "progress": {"done": 0, "total": 0},
+        "current": {"doc_id": None, "page": None},
+        "payload": payload,
+        "message": None,
+        "error": None,
+    }
+    _job_save(job)
+    return job
+
+
+def _iter_jobs() -> list[Dict[str, Any]]:
+    jobs: list[Dict[str, Any]] = []
+    if not JOBS_DIR.exists():
+        return jobs
+    for p in JOBS_DIR.iterdir():
+        if not p.is_file() or p.suffix.lower() != ".json":
+            continue
+        try:
+            jobs.append(json.loads(p.read_text(encoding="utf-8")))
+        except Exception:
+            continue
+    return jobs
+
+
+def _job_doc_ids(job: Dict[str, Any]) -> set[str]:
+    payload = job.get("payload") or {}
+    ids = payload.get("doc_ids") or []
+    if isinstance(ids, list):
+        return {str(x) for x in ids if x}
+    return set()
+
+
+def _find_running_job_for_doc(doc_id: str) -> str | None:
+    """
+    Если документ уже участвует в выполняющемся задании — вернём job_id.
+    Блокируем любые новые задания для этого документа, чтобы не плодить дубли.
+    """
+    did = str(doc_id)
+    for job in _iter_jobs():
+        if job.get("status") != "running":
+            continue
+        if did in _job_doc_ids(job):
+            jid = job.get("job_id")
+            if jid:
+                return str(jid)
+    return None
+
+
+JOB_CONFLICT_HTML = """
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <title>Задание уже выполняется</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 24px; }
+    .card { border: 1px solid #e5e7eb; border-radius: 12px; padding: 16px; margin-bottom: 16px; }
+    .warn { color: #b45309; font-weight: 700; }
+    code { background: #f3f4f6; padding: 2px 6px; border-radius: 6px; }
+    a { color: #1d4ed8; text-decoration: none; }
+    ul { margin: 8px 0 0 18px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2 class="warn">Для некоторых документов уже есть выполняющееся задание</h2>
+    <p>Новые задания для этих документов не создаются, чтобы избежать дублей.</p>
+    <ul>
+      {% for c in conflicts %}
+        <li>
+          Документ: <code>{{ c['doc_id'] }}</code>
+          → <a href="{{ url_for('job', job_id=c['job_id']) }}">Открыть задание</a>
+        </li>
+      {% endfor %}
+    </ul>
+  </div>
+  <div class="card">
+    <a href="{{ back_url }}">← Вернуться</a>
+  </div>
+</body>
+</html>
+"""
+
+def _job_set_progress(job_id: str, done: int, total: int, doc_id: str | None = None, page: int | None = None) -> None:
+    _job_update(
+        job_id,
+        updated_at=datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        progress={"done": int(done), "total": int(total)},
+        current={"doc_id": doc_id, "page": page},
+    )
+
+
+def _job_finish(job_id: str) -> None:
+    _job_update(
+        job_id,
+        status="done",
+        updated_at=datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        current={"doc_id": None, "page": None},
+    )
+
+
+def _job_fail(job_id: str, error: str) -> None:
+    LOGGER.error("JOB %s: ошибка: %s", job_id, error)
+    _job_update(
+        job_id,
+        status="error",
+        error=str(error),
+        updated_at=datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        current={"doc_id": None, "page": None},
+    )
+
+def _meta_path(doc_id: str) -> Path:
+    return _doc_dir(doc_id) / "meta.json"
+
+
+def _load_meta(doc_id: str) -> Dict[str, Any]:
+    p = _meta_path(doc_id)
+    if not p.exists():
+        return {}
+    return json.loads(p.read_text(encoding="utf-8"))
+
+
+def _save_meta(doc_id: str, meta: Dict[str, Any]) -> None:
+    p = _meta_path(doc_id)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _token_delta(before: Dict[str, int], after: Dict[str, int]) -> Dict[str, int]:
+    return {
+        "prompt_tokens": after.get("prompt_tokens", 0) - before.get("prompt_tokens", 0),
+        "completion_tokens": after.get("completion_tokens", 0)
+        - before.get("completion_tokens", 0),
+        "total_tokens": after.get("total_tokens", 0) - before.get("total_tokens", 0),
+    }
+
+
+def _add_tokens(meta: Dict[str, Any], delta: Dict[str, int]) -> None:
+    cur = meta.get("tokens") or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    for k in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        cur[k] = int(cur.get(k, 0)) + int(delta.get(k, 0))
+    meta["tokens"] = cur
+
+
+def _extract_pages(pdf_path: Path, out_dir: Path, dpi: int = 150, skip_existing: bool = True) -> int:
+    doc = fitz.open(pdf_path)
+    total = doc.page_count
+    for i in range(total):
+        page = doc.load_page(i)
+        page_num = i + 1
+        page_dir = out_dir / f"page_{page_num:03d}"
+        page_dir.mkdir(parents=True, exist_ok=True)
+
+        txt_path = page_dir / "page.txt"
+        if not (skip_existing and txt_path.exists()):
+            text = page.get_text("text")
+            txt_path.write_text(text, encoding="utf-8")
+
+        img_path = page_dir / "page.jpg"
+        if not (skip_existing and img_path.exists()):
+            pix = page.get_pixmap(dpi=dpi)
+            pix.save(str(img_path))
+    return total
+
+
+def _page_dir(doc_id: str, page_num: int) -> Path:
+    return _doc_dir(doc_id) / f"page_{page_num:03d}"
+
+
+def _ensure_access_token() -> str:
+    creds = get_creds()
+    token = creds.get("access_token")
+    # cert-mode: токена может не быть, тогда работаем через mTLS (см. img_parse.py)
+    if not token and creds.get("auth_mode") == "cert":
+        return ""
+    if not token:
+        raise RuntimeError(f"Токен не получен от NGW. Ответ: {creds}")
+    return str(token)
+
+
+def _process_page(
+    doc_id: str,
+    page_num: int,
+    access_token: str | None = None,
+    force: bool = False,
+) -> None:
+    meta = _load_meta(doc_id)
+    model = meta.get("model") or os.getenv("GIGA_TEXT_MODEL", "GigaChat-2-Pro")
+    temperature = float(meta.get("temperature", 0.01))
+
+    access_token = access_token or _ensure_access_token()
+    page_dir = _page_dir(doc_id, page_num)
+    img_path = page_dir / "page.jpg"
+    text_path = page_dir / "page.txt"
+    if not img_path.exists() or not text_path.exists():
+        raise FileNotFoundError("Не найдены файлы страницы (page.jpg/page.txt).")
+
+    instr_path = page_dir / "instruction.txt"
+    if instr_path.exists() and not force:
+        # Уже обработано — ничего не пересоздаём.
+        return
+
+    before = get_token_stats()
+
+    # OCR по изображению
+    ocr_path = page_dir / "ocr.txt"
+    if ocr_path.exists() and not force:
+        ocr_text = ocr_path.read_text(encoding="utf-8")
+    else:
+        ocr_text = ocr_instruction_via_rest(
+            str(img_path),
+            access_token,
+            model=model,
+            temperature=temperature,
+        )
+        ocr_path.write_text(ocr_text, encoding="utf-8")
+
+    # Merge: текстовый слой + OCR → instruction.txt
+    text_layer = text_path.read_text(encoding="utf-8")
+    merge_question = (
+        "У тебя есть две версии ОДНОЙ И ТОЙ ЖЕ страницы инструкции по работе в АС.\n\n"
+        "Текстовый слой страницы (из PDF):\n"
+        "----------------------------------------\n"
+        f"{text_layer}\n"
+        "----------------------------------------\n\n"
+        "Текст, полученный по скриншоту страницы:\n"
+        "----------------------------------------\n"
+        f"{ocr_text}\n"
+        "----------------------------------------\n\n"
+        "Сформируй одну целостную инструкцию по этой странице.\n"
+        "Строгие правила: не придумывай ничего, чего нет в исходных текстах. Убирай повторы.\n"
+    )
+    sys_prompt_merge = (
+        "Ты опытный методолог. Объединяй версии одной страницы инструкции строго без домыслов."
+    )
+    instruction = giga_free_answer(
+        question=merge_question,
+        access_token=access_token,
+        sys_prompt=sys_prompt_merge,
+        model=model,
+        temperature=temperature,
+    )
+    instr_path.write_text(instruction, encoding="utf-8")
+
+
+    after = get_token_stats()
+    delta = _token_delta(before, after)
+    _add_tokens(meta, delta)
+    meta["last_op"] = {"type": "process_page", "page": page_num, "token_delta": delta}
+    _save_meta(doc_id, meta)
+
+
+def _ocr_only_page(
+    doc_id: str,
+    page_num: int,
+    access_token: str | None = None,
+    force: bool = False,
+) -> None:
+    """
+    Простая обработка: только OCR по page.jpg → ocr.txt
+    Без merge.
+    """
+    meta = _load_meta(doc_id)
+    model = meta.get("model") or os.getenv("GIGA_TEXT_MODEL", "GigaChat-2-Pro")
+    temperature = float(meta.get("temperature", 0.01))
+
+    access_token = access_token or _ensure_access_token()
+    page_dir = _page_dir(doc_id, page_num)
+    img_path = page_dir / "page.jpg"
+    if not img_path.exists():
+        raise FileNotFoundError("Не найден файл страницы (page.jpg).")
+
+    ocr_path = page_dir / "ocr.txt"
+    if ocr_path.exists() and not force:
+        return
+
+    before = get_token_stats()
+    ocr_text = ocr_instruction_via_rest(
+        str(img_path),
+        access_token,
+        model=model,
+        temperature=temperature,
+    )
+    ocr_path.write_text(ocr_text, encoding="utf-8")
+    after = get_token_stats()
+    delta = _token_delta(before, after)
+    _add_tokens(meta, delta)
+    meta["last_op"] = {"type": "ocr_only_page", "page": page_num, "token_delta": delta}
+    _save_meta(doc_id, meta)
+
+
+def _source_line(pamphlet_name: str, page_num: int) -> str:
+    safe = (pamphlet_name or "document").replace('"', "'").strip()
+    return f'[SOURCE - "{safe} - {page_num:03d}"]'
+
+
+def _instruction_from_ocr_only_page(
+    doc_id: str,
+    page_num: int,
+    access_token: str | None = None,
+    force: bool = False,
+) -> None:
+    """
+    Инструкция по странице ТОЛЬКО из OCR:
+      - гарантируем наличие ocr.txt (делаем OCR если нет)
+      - instruction.txt = ocr.txt + SOURCE
+    Без merge.
+    """
+    meta = _load_meta(doc_id)
+    page_dir = _page_dir(doc_id, page_num)
+    instr_path = page_dir / "instruction.txt"
+    if instr_path.exists() and not force:
+        return
+
+    # 1) OCR (resume-safe)
+    _ocr_only_page(doc_id, page_num, access_token=access_token, force=force)
+    ocr_path = page_dir / "ocr.txt"
+    ocr_text = ocr_path.read_text(encoding="utf-8").strip() if ocr_path.exists() else ""
+
+    src = _source_line(str(meta.get("pamphlet_name", meta.get("filename", "document"))), page_num)
+    if ocr_text:
+        instr_path.write_text(f"{ocr_text}\n\n{src}\n", encoding="utf-8")
+    else:
+        instr_path.write_text(f"{src}\n", encoding="utf-8")
+
+
+def _instruction_from_text_layer_page(
+    doc_id: str,
+    page_num: int,
+    access_token: str | None = None,
+    force: bool = False,
+) -> None:
+    """
+    Инструкция по странице ТОЛЬКО из текстового слоя PDF (без OCR).
+    Текст форматируется через LLM для структурирования.
+    """
+    meta = _load_meta(doc_id)
+    model = meta.get("model") or os.getenv("GIGA_TEXT_MODEL", "GigaChat-2-Pro")
+    temperature = float(meta.get("temperature", 0.01))
+
+    access_token = access_token or _ensure_access_token()
+    page_dir = _page_dir(doc_id, page_num)
+
+    instr_path = page_dir / "instruction.txt"
+    if instr_path.exists() and not force:
+        return
+
+    text_path = page_dir / "page.txt"
+    text_layer = text_path.read_text(encoding="utf-8").strip() if text_path.exists() else ""
+
+    if not text_layer:
+        LOGGER.info(
+            "doc=%s page=%s: text-only skip LLM (empty page.txt)",
+            doc_id,
+            page_num,
+        )
+        src = _source_line(str(meta.get("pamphlet_name", meta.get("filename", "document"))), page_num)
+        instr_path.write_text(f"{src}\n", encoding="utf-8")
+        return
+
+    before = get_token_stats()
+
+    # Форматируем текстовый слой через LLM (только структурирование, без изменений содержания)
+    format_question = (
+        "Перед тобой текстовый слой страницы инструкции по работе в АС (извлечён из PDF).\n"
+        "----------------------------------------\n"
+        f"{text_layer}\n"
+        "----------------------------------------\n\n"
+        "Твоя задача — ТОЛЬКО структурировать текст для удобства чтения.\n\n"
+        "КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО:\n"
+        "- Переформулировать текст своими словами\n"
+        "- Добавлять новые слова, фразы, шаги, советы, предупреждения\n"
+        "- Менять формулировки (даже «улучшая» их)\n"
+        "- Дополнять или расширять смысл\n"
+        "- Исправлять «ошибки» в терминах или названиях\n\n"
+        "РАЗРЕШЕНО ТОЛЬКО:\n"
+        "- Добавить переносы строк между абзацами/пунктами\n"
+        "- Убрать лишние пробелы и пустые строки\n"
+        "- Исправить разрыв слова переносом (напр.: «ин-\\nструкция» → «инструкция»)\n"
+        "- Удалить мусорные символы (артефакты PDF)\n"
+        "- Удалить элементы UI просмотрщика/браузера, водяные знаки\n\n"
+        "ВСЕ СЛОВА И ФРАЗЫ ДОЛЖНЫ БЫТЬ ДОСЛОВНО ИЗ ИСХОДНОГО ТЕКСТА.\n"
+        "Верни ТОЛЬКО структурированный текст, без комментариев.\n"
+    )
+
+    sys_prompt_format = (
+        "Ты технический редактор. Твоя единственная задача — структурировать текст, "
+        "НЕ меняя ни одного слова. Используй ТОЛЬКО дословный текст из входа. "
+        "Любая переформулировка или добавление — грубая ошибка."
+    )
+
+    instruction = giga_free_answer(
+        question=format_question,
+        access_token=access_token,
+        sys_prompt=sys_prompt_format,
+        model=model,
+        temperature=0.0,  # Минимум креативности
+    )
+    instr_path.write_text(instruction, encoding="utf-8")
+
+    after = get_token_stats()
+    delta = _token_delta(before, after)
+    _add_tokens(meta, delta)
+    meta["last_op"] = {"type": "format_text_layer", "page": page_num, "token_delta": delta}
+    _save_meta(doc_id, meta)
+
+
+def _instruction_merge_existing_ocr_page(
+    doc_id: str,
+    page_num: int,
+    access_token: str | None = None,
+    force: bool = False,
+) -> None:
+    """
+    Создать инструкцию из уже распознанного OCR (ocr.txt) и текстового слоя (page.txt).
+    Приоритет: текстовый слой — авторитетный, OCR — вспомогательный.
+    Не делает повторный OCR, использует существующий ocr.txt.
+    """
+    meta = _load_meta(doc_id)
+    model = meta.get("model") or os.getenv("GIGA_TEXT_MODEL", "GigaChat-2-Pro")
+    temperature = float(meta.get("temperature", 0.01))
+
+    access_token = access_token or _ensure_access_token()
+    page_dir = _page_dir(doc_id, page_num)
+
+    instr_path = page_dir / "instruction.txt"
+    if instr_path.exists() and not force:
+        return
+
+    text_path = page_dir / "page.txt"
+    ocr_path = page_dir / "ocr.txt"
+
+    if not text_path.exists() and not ocr_path.exists():
+        raise FileNotFoundError("Не найдены файлы page.txt и ocr.txt для merge.")
+
+    text_layer = text_path.read_text(encoding="utf-8").strip() if text_path.exists() else ""
+    ocr_text = ocr_path.read_text(encoding="utf-8").strip() if ocr_path.exists() else ""
+
+    # Если есть только один источник — используем его напрямую
+    if not text_layer and ocr_text:
+        src = _source_line(str(meta.get("pamphlet_name", meta.get("filename", "document"))), page_num)
+        instr_path.write_text(f"{ocr_text}\n\n{src}\n", encoding="utf-8")
+        return
+    if text_layer and not ocr_text:
+        src = _source_line(str(meta.get("pamphlet_name", meta.get("filename", "document"))), page_num)
+        instr_path.write_text(f"{text_layer}\n\n{src}\n", encoding="utf-8")
+        return
+
+    before = get_token_stats()
+
+    # Merge с приоритетом текстового слоя
+    merge_question = (
+        "У тебя есть две версии ОДНОЙ И ТОЙ ЖЕ страницы инструкции по работе в АС.\n\n"
+        "ВЕРСИЯ A (АВТОРИТЕТНАЯ): текстовый слой страницы (из PDF).\n"
+        "Это основной источник истины: он должен определять формулировки, порядок и содержание.\n"
+        "----------------------------------------\n"
+        f"{text_layer}\n"
+        "----------------------------------------\n\n"
+        "ВЕРСИЯ B (ВСПОМОГАТЕЛЬНАЯ): текст, полученный OCR по скриншоту той же страницы.\n"
+        "OCR может содержать мусор (артефакты, обрывки UI-обвязки, водяные знаки, ошибки распознавания).\n"
+        "Используй OCR ТОЛЬКО как подсказку для восстановления явно ПРОПУЩЕННЫХ фрагментов, "
+        "если они отсутствуют в версии A, но хорошо читаются в версии B.\n"
+        "----------------------------------------\n"
+        f"{ocr_text}\n"
+        "----------------------------------------\n\n"
+        "Твоя задача — сделать один аккуратный итоговый текст этой страницы.\n\n"
+        "Строгие правила (критично):\n"
+        "1) ПРИОРИТЕТ: если версия A содержит фразу/пункт, а версия B отличается или противоречит — "
+        "ВСЕГДА выбирай версию A. Не «улучшай» и не переписывай по OCR.\n"
+        "2) OCR-добавления разрешены ТОЛЬКО если:\n"
+        "   - в версии A есть очевидный пропуск/пустое место/обрыв строки, и\n"
+        "   - в версии B этот же фрагмент читается ясно, и\n"
+        "   - добавление не похоже на UI-обвязку/шум/водяной знак/служебный текст.\n"
+        "   Если есть сомнение — НЕ добавляй.\n"
+        "3) АНТИ-МУСОР: не включай в итоговый текст элементы интерфейса/просмотрщика/браузера, "
+        "водяные знаки и прочие посторонние надписи.\n"
+        "4) НЕЛЬЗЯ придумывать ни одного нового шага, кнопки, поля, предупреждения.\n"
+        "5) Итог должен быть максимально близок к версии A по содержанию. "
+        "Верни ТОЛЬКО итоговый текст страницы, без комментариев.\n"
+    )
+
+    sys_prompt_merge = (
+        "Ты опытный методолог и сотрудник кредитного отдела банка. "
+        "Твоя задача — строго и аккуратно объединять две версии одной страницы "
+        "в единый текст БЕЗ добавления новых смыслов.\n"
+        "Критично: версия A (текстовый слой PDF) — авторитетная. "
+        "Версия B (OCR) — только вспомогательная. "
+        "Если есть конфликт — выбирай версию A."
+    )
+
+    instruction = giga_free_answer(
+        question=merge_question,
+        access_token=access_token,
+        sys_prompt=sys_prompt_merge,
+        model=model,
+        temperature=0.0,  # Минимум креативности для merge
+    )
+    instr_path.write_text(instruction, encoding="utf-8")
+
+    after = get_token_stats()
+    delta = _token_delta(before, after)
+    _add_tokens(meta, delta)
+    meta["last_op"] = {"type": "merge_existing_ocr", "page": page_num, "token_delta": delta}
+    _save_meta(doc_id, meta)
+
+
+def _job_worker_instr_text_only_docs(job_id: str, doc_ids: list[str]) -> None:
+    """
+    Job: создать instruction.txt из текстового слоя PDF (без OCR) для всех страниц.
+    Текст форматируется через LLM.
+    """
+    try:
+        LOGGER.info("JOB %s: instr_text_only start. docs=%s", job_id, ",".join(doc_ids))
+        token = _ensure_access_token()
+        targets: list[tuple[str, int]] = []
+        for did in doc_ids:
+            meta = _load_meta(did)
+            pages = int(meta.get("pages", 0) or 0)
+            for p in range(1, pages + 1):
+                pd = _page_dir(did, p)
+                if (pd / "instruction.txt").exists():
+                    continue
+                targets.append((did, p))
+
+        total = len(targets)
+        done = 0
+        _job_set_progress(job_id, done=done, total=total)
+        if total == 0:
+            _job_update(
+                job_id,
+                message=(
+                    "Нечего делать: все страницы уже имеют instruction.txt. "
+                    "Если нужно пересоздать — удалите instruction.txt или используйте обработку поштучно."
+                ),
+            )
+            LOGGER.info("JOB %s: instr_text_only nothing to do", job_id)
+            _job_finish(job_id)
+            return
+
+        for did, p in targets:
+            LOGGER.info("JOB %s: instr_text_only doc=%s page=%s", job_id, did, p)
+            _job_set_progress(job_id, done=done, total=total, doc_id=did, page=p)
+            _instruction_from_text_layer_page(did, p, access_token=token)
+            done += 1
+
+        _job_set_progress(job_id, done=done, total=total)
+        LOGGER.info("JOB %s: instr_text_only done. total=%s", job_id, total)
+        _job_finish(job_id)
+    except Exception as e:
+        LOGGER.exception("JOB %s: instr_text_only failed", job_id)
+        _job_fail(job_id, str(e))
+
+
+def _job_worker_instr_ocr_only_docs(job_id: str, doc_ids: list[str]) -> None:
+    """
+    Job: создать instruction.txt из OCR для всех страниц (где ещё нет instruction.txt).
+    """
+    try:
+        LOGGER.info("JOB %s: instr_ocr_only start. docs=%s", job_id, ",".join(doc_ids))
+        token = _ensure_access_token()
+        targets: list[tuple[str, int]] = []
+        for did in doc_ids:
+            meta = _load_meta(did)
+            pages = int(meta.get("pages", 0) or 0)
+            for p in range(1, pages + 1):
+                pd = _page_dir(did, p)
+                if (pd / "instruction.txt").exists():
+                    continue
+                targets.append((did, p))
+
+        total = len(targets)
+        done = 0
+        _job_set_progress(job_id, done=done, total=total)
+
+        for did, p in targets:
+            LOGGER.info("JOB %s: instr_ocr_only doc=%s page=%s", job_id, did, p)
+            _job_set_progress(job_id, done=done, total=total, doc_id=did, page=p)
+            _instruction_from_ocr_only_page(did, p, access_token=token)
+            done += 1
+
+        _job_set_progress(job_id, done=done, total=total)
+        LOGGER.info("JOB %s: instr_ocr_only done. total=%s", job_id, total)
+        _job_finish(job_id)
+    except Exception as e:
+        LOGGER.exception("JOB %s: instr_ocr_only failed", job_id)
+        _job_fail(job_id, str(e))
+
+def _generate_faq_for_page(doc_id: str, page_num: int, access_token: str | None = None, force: bool = False) -> None:
+    meta = _load_meta(doc_id)
+    model = meta.get("model") or os.getenv("GIGA_TEXT_MODEL", "GigaChat-2-Pro")
+    temperature = float(meta.get("temperature", 0.01))
+
+    access_token = access_token or _ensure_access_token()
+    page_dir = _page_dir(doc_id, page_num)
+    instr_path = page_dir / "instruction.txt"
+    if not instr_path.exists():
+        raise FileNotFoundError("Сначала выполните обработку страницы (instruction.txt не найден).")
+
+    faq_path = page_dir / "faq.md"
+    if faq_path.exists() and not force:
+        # Уже создано — не пересоздаём.
+        return
+
+    # Контекст документа: используем текущую инструкцию страницы
+    doc_text = instr_path.read_text(encoding="utf-8")
+
+    doc_ctx = _build_doc_context(doc_text, max_chars=12000)
+    page_text = instr_path.read_text(encoding="utf-8")
+
+    before = get_token_stats()
+    faq_md = generate_faq_for_pages(
+        pages=[(page_num, page_text)],
+        full_doc_context=doc_ctx,
+        access_token=access_token,
+        pamphlet_name=str(meta.get("pamphlet_name", meta.get("filename", "Памятка"))),
+        output_tokens=10000,
+    )
+    after = get_token_stats()
+    delta = _token_delta(before, after)
+
+    faq_path.write_text(faq_md, encoding="utf-8")
+
+    _add_tokens(meta, delta)
+    meta["last_op"] = {"type": "faq_page", "page": page_num, "token_delta": delta}
+    _save_meta(doc_id, meta)
+
+def _process_all_pages(doc_id: str) -> tuple[int, int]:
+    """
+    Массовая обработка: OCR+Merge+контекст для всех страниц документа.
+    Возвращает (processed, total_pages).
+    """
+    meta = _load_meta(doc_id)
+    total = int(meta.get("pages", 0) or 0)
+    if total <= 0:
+        return 0, 0
+    token = _ensure_access_token()
+    targets = []
+    for p in range(1, total + 1):
+        pd = _page_dir(doc_id, p)
+        if not (pd / "instruction.txt").exists():
+            targets.append(p)
+    processed = 0
+    for p in targets:
+        _process_page(doc_id, p, access_token=token)
+        processed += 1
+    return processed, len(targets)
+
+
+def _faq_all_pages(doc_id: str) -> tuple[int, int]:
+    """
+    Массовая генерация FAQ для всех страниц, где уже создан instruction.txt.
+    Возвращает (generated, total_pages).
+    """
+    meta = _load_meta(doc_id)
+    total = int(meta.get("pages", 0) or 0)
+    if total <= 0:
+        return 0, 0
+    token = _ensure_access_token()
+    targets = []
+    for p in range(1, total + 1):
+        pd = _page_dir(doc_id, p)
+        if not (pd / "instruction.txt").exists():
+            continue
+        if (pd / "faq.md").exists():
+            continue
+        targets.append(p)
+    generated = 0
+    for p in targets:
+        _generate_faq_for_page(doc_id, p, access_token=token)
+        generated += 1
+    return generated, len(targets)
+
+def _job_worker_process_docs(job_id: str, doc_ids: list[str]) -> None:
+    """
+    Job: обработать все страницы для списка документов.
+    """
+    try:
+        LOGGER.info("JOB %s: process_docs start. docs=%s", job_id, ",".join(doc_ids))
+        token = _ensure_access_token()
+        # total = только страницы, которые ещё не обработаны (нет instruction.txt)
+        targets: list[tuple[str, int]] = []
+        for did in doc_ids:
+            meta = _load_meta(did)
+            pages = int(meta.get("pages", 0) or 0)
+            for p in range(1, pages + 1):
+                pd = _page_dir(did, p)
+                if (pd / "instruction.txt").exists():
+                    continue
+                targets.append((did, p))
+
+        total = len(targets)
+        done = 0
+        _job_set_progress(job_id, done=done, total=total)
+
+        for did, p in targets:
+            LOGGER.info("JOB %s: process_docs doc=%s page=%s", job_id, did, p)
+            _job_set_progress(job_id, done=done, total=total, doc_id=did, page=p)
+            _process_page(did, p, access_token=token)
+            done += 1
+
+        _job_set_progress(job_id, done=done, total=total)
+        LOGGER.info("JOB %s: process_docs done. total=%s", job_id, total)
+        _job_finish(job_id)
+    except Exception as e:
+        LOGGER.exception("JOB %s: process_docs failed", job_id)
+        _job_fail(job_id, str(e))
+
+
+def _job_worker_ocr_only_docs(job_id: str, doc_ids: list[str]) -> None:
+    """
+    Job: простой OCR по всем страницам документов (где ещё нет ocr.txt).
+    """
+    try:
+        LOGGER.info("JOB %s: ocr_only start. docs=%s", job_id, ",".join(doc_ids))
+        token = _ensure_access_token()
+        targets: list[tuple[str, int]] = []
+        for did in doc_ids:
+            meta = _load_meta(did)
+            pages = int(meta.get("pages", 0) or 0)
+            for p in range(1, pages + 1):
+                pd = _page_dir(did, p)
+                if (pd / "ocr.txt").exists():
+                    continue
+                targets.append((did, p))
+
+        total = len(targets)
+        done = 0
+        _job_set_progress(job_id, done=done, total=total)
+
+        for did, p in targets:
+            LOGGER.info("JOB %s: ocr_only doc=%s page=%s", job_id, did, p)
+            _job_set_progress(job_id, done=done, total=total, doc_id=did, page=p)
+            _ocr_only_page(did, p, access_token=token)
+            done += 1
+
+        _job_set_progress(job_id, done=done, total=total)
+        LOGGER.info("JOB %s: ocr_only done. total=%s", job_id, total)
+        _job_finish(job_id)
+    except Exception as e:
+        LOGGER.exception("JOB %s: ocr_only failed", job_id)
+        _job_fail(job_id, str(e))
+
+
+def _job_worker_faq_docs(job_id: str, doc_ids: list[str]) -> None:
+    """
+    Job: сгенерировать FAQ для всех страниц документов, где уже есть instruction.txt.
+    """
+    try:
+        LOGGER.info("JOB %s: faq_docs start. docs=%s", job_id, ",".join(doc_ids))
+        token = _ensure_access_token()
+        # total = только страницы, где есть instruction.txt, но нет faq.md
+        page_targets: list[tuple[str, int]] = []
+        for did in doc_ids:
+            meta = _load_meta(did)
+            pages = int(meta.get("pages", 0) or 0)
+            for p in range(1, pages + 1):
+                pd = _page_dir(did, p)
+                if not (pd / "instruction.txt").exists():
+                    continue
+                if (pd / "faq.md").exists():
+                    continue
+                page_targets.append((did, p))
+
+        total = len(page_targets)
+        done = 0
+        _job_set_progress(job_id, done=done, total=total)
+
+        if total == 0:
+            _job_update(
+                job_id,
+                message=(
+                    "Нечего делать: нет страниц для генерации FAQ. "
+                    "Причины: (1) FAQ уже сгенерирован (есть page_XXX/faq.md), "
+                    "(2) нет instruction.txt, по которому строится FAQ."
+                ),
+            )
+            _job_finish(job_id)
+            return
+
+        for did, p in page_targets:
+            LOGGER.info("JOB %s: faq_docs doc=%s page=%s", job_id, did, p)
+            _job_set_progress(job_id, done=done, total=total, doc_id=did, page=p)
+            _generate_faq_for_page(did, p, access_token=token)
+            done += 1
+
+        _job_set_progress(job_id, done=done, total=total)
+        LOGGER.info("JOB %s: faq_docs done. total=%s", job_id, total)
+        _job_finish(job_id)
+    except Exception as e:
+        LOGGER.exception("JOB %s: faq_docs failed", job_id)
+        _job_fail(job_id, str(e))
+
+
+def _start_job_thread(job_id: str, target, *args) -> None:
+    t = threading.Thread(target=target, args=(job_id, *args), daemon=True)
+    with JOBS_LOCK:
+        JOB_THREADS[job_id] = t
+    LOGGER.info("JOB %s: thread started (%s)", job_id, target.__name__)
+    t.start()
+
+
+def _build_instruction_export_md(doc_id: str) -> str:
+    """
+    Собираем итоговую инструкцию для выгрузки.
+    Всегда собираем из отдельных instruction.txt по страницам с заголовками.
+    Это гарантирует, что все обработанные страницы попадут в итоговый файл.
+    """
+    meta = _load_meta(doc_id)
+    pages = int(meta.get("pages", 0) or 0)
+    chunks = []
+    for p in range(1, pages + 1):
+        pd = _page_dir(doc_id, p)
+        ip = pd / "instruction.txt"
+        if not ip.exists():
+            continue
+        txt = ip.read_text(encoding="utf-8").strip()
+        if not txt:
+            continue
+        chunks.append(f"## Страница {p:03d}\n\n{txt}\n")
+    return "\n\n".join(chunks).strip() + "\n"
+
+
+def _render_docx_from_markdown(md_text: str, title: str = "Instruction") -> bytes:
+    """
+    Конвертация Markdown → DOCX через pandoc (CLI).
+    Требует установленный pandoc в окружении (или указать путь через PANDOC_PATH).
+    Устанавливает русский язык документа и простое форматирование.
+    """
+    pandoc = (os.getenv("PANDOC_PATH") or "pandoc").strip()
+    reference_docx = (os.getenv("PANDOC_REFERENCE_DOCX") or "").strip()
+
+    # Пишем во временные файлы внутри проекта документа, чтобы не зависеть от tmp-политик.
+    tmp_dir = APP_DATA_DIR / "_tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    tmp_id = str(uuid.uuid4())
+    md_path = tmp_dir / f"{tmp_id}.md"
+    docx_path = tmp_dir / f"{tmp_id}.docx"
+    md_path.write_text(md_text, encoding="utf-8")
+
+    cmd = [
+        pandoc,
+        str(md_path),
+        "-f",
+        "markdown-smart",  # простой markdown без типографских замен
+        "-t",
+        "docx",
+        "-o",
+        str(docx_path),
+        "--metadata", f"title={title}",
+        "--metadata", "lang=ru-RU",           # основной язык документа — русский
+        "--metadata", "author=Smart PDF Parser",
+    ]
+    if reference_docx:
+        cmd.extend(["--reference-doc", reference_docx])
+
+    try:
+        subprocess.run(cmd, capture_output=True, text=True, check=True)
+    except FileNotFoundError as e:
+        raise RuntimeError(
+            "Pandoc не найден. Установите pandoc или задайте путь через PANDOC_PATH."
+        ) from e
+    except subprocess.CalledProcessError as e:
+        out = (e.stdout or "") + "\n" + (e.stderr or "")
+        raise RuntimeError(f"Ошибка pandoc при конвертации в docx:\n{out.strip()}") from e
+
+    data = docx_path.read_bytes()
+
+    # best-effort cleanup
+    try:
+        md_path.unlink(missing_ok=True)
+        docx_path.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+    return data
+
+
+def _build_faq_export_md(doc_id: str) -> str:
+    """
+    Склеиваем FAQ по всем страницам (page_XXX/faq.md).
+    """
+    meta = _load_meta(doc_id)
+    pages = int(meta.get("pages", 0) or 0)
+    chunks = []
+    for p in range(1, pages + 1):
+        pd = _page_dir(doc_id, p)
+        fp = pd / "faq.md"
+        if not fp.exists():
+            continue
+        txt = fp.read_text(encoding="utf-8").strip()
+        if not txt:
+            continue
+        chunks.append(txt)
+    return "\n\n".join(chunks).strip() + "\n"
+
+def _parse_faq_md_to_rows(md: str) -> list[dict]:
+    """
+    Поддерживаем формат:
+      ВОПРОС: ...
+      ОТВЕТ/ИНСТРУКЦИЯ: ...
+      [SOURCE - "..."]
+    """
+    import re
+
+    block_re = re.compile(
+        r"ВОПРОС:\s*(?P<q>.*?)(?:\r?\n)+"
+        r"(?:ОТВЕТ|ИНСТРУКЦИЯ):\s*(?P<a>.*?)(?:\r?\n)+"
+        r"\[SOURCE\s*-\s*\"(?P<s>.*?)\"\]\s*",
+        re.DOTALL | re.IGNORECASE,
+    )
+    rows = []
+    for m in block_re.finditer(md.strip()):
+        rows.append(
+            {
+                "question": m.group("q").strip(),
+                "answer": m.group("a").strip(),
+                "source": m.group("s").strip(),
+            }
+        )
+    return rows
+
+
+def _rows_to_xlsx_bytes(rows: list[dict]) -> bytes:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "FAQ"
+    ws.append(["Вопрос", "Ответ", "Источник"])
+    for r in rows:
+        ws.append([r.get("question", ""), r.get("answer", ""), r.get("source", "")])
+    ws.column_dimensions["A"].width = 60
+    ws.column_dimensions["B"].width = 90
+    ws.column_dimensions["C"].width = 40
+
+    bio = BytesIO()
+    wb.save(bio)
+    return bio.getvalue()
+
+
+def _missing_pages(doc_id: str, kind: str) -> list[int]:
+    """
+    kind:
+      - "instruction": проверяем наличие page_XXX/instruction.txt
+      - "faq": проверяем наличие page_XXX/faq.md
+    """
+    meta = _load_meta(doc_id)
+    pages = int(meta.get("pages", 0) or 0)
+    missing: list[int] = []
+    filename = "instruction.txt" if kind == "instruction" else "faq.md"
+    for p in range(1, pages + 1):
+        pd = _page_dir(doc_id, p)
+        if not (pd / filename).exists():
+            missing.append(p)
+    return missing
+
+
+app = Flask(__name__)
+app.secret_key = os.getenv("WEB_SECRET_KEY", "dev-secret")
+
+
+INDEX_HTML = """
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <title>Smart PDF Parser — Web UI</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 24px; }
+    .card { border: 1px solid #e5e7eb; border-radius: 12px; padding: 16px; margin-bottom: 16px; }
+    .row { display: flex; gap: 16px; flex-wrap: wrap; }
+    label { display: block; font-weight: 600; margin-top: 8px; }
+    input[type="text"], input[type="number"] { width: 320px; padding: 8px; border: 1px solid #d1d5db; border-radius: 8px; }
+    input[type="file"] { margin-top: 8px; }
+    button { padding: 10px 14px; border: 0; border-radius: 10px; background: #111827; color: #fff; cursor: pointer; }
+    a { color: #1d4ed8; text-decoration: none; }
+    .muted { color: #6b7280; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 8px; border-bottom: 1px solid #eee; text-align: left; }
+  </style>
+</head>
+<body>
+  <h2>Smart PDF Parser — Web UI</h2>
+
+  <div class="card">
+    <h3>Загрузить памятки (PDF)</h3>
+    <form action="{{ url_for('upload') }}" method="post" enctype="multipart/form-data">
+      <label>PDF файлы</label>
+      <input type="file" name="pdfs" accept="application/pdf" multiple required>
+
+      <div class="row">
+        <div>
+          <label>Модель</label>
+          <input type="text" name="model" value="GigaChat-2-Pro">
+        </div>
+        <div>
+          <label>Температура</label>
+          <input type="number" step="0.01" min="0" max="2" name="temperature" value="0.01">
+        </div>
+      </div>
+
+      <div style="margin-top: 12px;">
+        <button type="submit">Загрузить и разобрать страницы</button>
+      </div>
+      <p class="muted">После загрузки: создаются page_XXX/page.txt и page_XXX/page.jpg. Обработка страниц и FAQ — по кнопкам.</p>
+    </form>
+  </div>
+
+  <div class="card">
+    <h3>Документы</h3>
+    {% if docs %}
+      <form action="{{ url_for('batch_process_docs') }}" method="post">
+        <div class="row" style="align-items:center; margin-bottom: 8px; flex-wrap: wrap;">
+          <button type="submit" name="action" value="process">Обработать выбранные (все страницы)</button>
+          <button type="submit" name="action" value="ocr_only">OCR только</button>
+          <button type="submit" name="action" value="instr_ocr_only">Инструкция (OCR only)</button>
+          <button type="submit" name="action" value="instr_text_only" style="background:#6b7280;" title="Создать инструкции только из текстового слоя PDF, без распознавания">Инструкция из текста (без OCR)</button>
+          <button type="submit" name="action" value="faq">Сгенерировать FAQ</button>
+          <span class="muted">Внимание: массовые операции могут выполняться долго.</span>
+        </div>
+        <table>
+          <thead><tr><th></th><th>Памятка</th><th>Страниц</th><th>Токены (total)</th><th></th></tr></thead>
+          <tbody>
+          {% for d in docs %}
+            <tr>
+              <td><input type="checkbox" name="doc_id" value="{{ d['doc_id'] }}"></td>
+              <td><strong>{{ d['pamphlet_name'] }}</strong><div class="muted">{{ d['doc_id'] }}</div></td>
+              <td>{{ d.get('pages', '?') }}</td>
+              <td>{{ d.get('tokens', {}).get('total_tokens', 0) }}</td>
+              <td><a href="{{ url_for('doc', doc_id=d['doc_id']) }}">Открыть</a></td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </form>
+    {% else %}
+      <p class="muted">Пока нет загруженных документов.</p>
+    {% endif %}
+  </div>
+</body>
+</html>
+"""
+
+
+DOC_HTML = """
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <title>{{ meta.get('pamphlet_name','Документ') }} — Smart PDF Parser</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 24px; }
+    .card { border: 1px solid #e5e7eb; border-radius: 12px; padding: 16px; margin-bottom: 16px; }
+    a { color: #1d4ed8; text-decoration: none; }
+    .muted { color: #6b7280; }
+    .row { display:flex; gap: 16px; flex-wrap: wrap; align-items: center; }
+    button { padding: 10px 14px; border: 0; border-radius: 10px; background: #111827; color: #fff; cursor: pointer; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 8px; border-bottom: 1px solid #eee; text-align: left; }
+    code { background: #f3f4f6; padding: 2px 6px; border-radius: 6px; }
+  </style>
+</head>
+<body>
+  <div class="row" style="justify-content: space-between;">
+    <h2>{{ meta.get('pamphlet_name','Документ') }}</h2>
+    <a href="{{ url_for('index') }}">← назад</a>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <div><strong>ID:</strong> <code>{{ doc_id }}</code></div>
+      <div><strong>Модель:</strong> <code>{{ meta.get('model') }}</code></div>
+      <div><strong>Температура:</strong> <code>{{ meta.get('temperature') }}</code></div>
+      <div><strong>Токены total:</strong> <code>{{ meta.get('tokens', {}).get('total_tokens', 0) }}</code></div>
+    </div>
+    <p class="muted"><strong>Каталог документа:</strong> <code>{{ meta.get('storage_dir','') }}</code></p>
+    <div class="row">
+      <a href="{{ url_for('download_instruction', doc_id=doc_id) }}">Скачать итоговую инструкцию (.md)</a>
+      <a href="{{ url_for('download_instruction_docx', doc_id=doc_id) }}">Скачать итоговую инструкцию (.docx)</a>
+      <a href="{{ url_for('download_faq_xlsx', doc_id=doc_id) }}">Скачать FAQ по всем страницам (.xlsx)</a>
+    </div>
+    <div class="row" style="margin-top: 10px;">
+      <form action="{{ url_for('doc_process_all', doc_id=doc_id) }}" method="post">
+        <button type="submit">Обработать все страницы</button>
+      </form>
+      <form action="{{ url_for('doc_ocr_only_all', doc_id=doc_id) }}" method="post">
+        <button type="submit">OCR только (все страницы)</button>
+      </form>
+      <form action="{{ url_for('doc_instruction_ocr_only_all', doc_id=doc_id) }}" method="post">
+        <button type="submit">Инструкция (OCR only)</button>
+      </form>
+      <form action="{{ url_for('doc_instruction_text_only_all', doc_id=doc_id) }}" method="post">
+        <button type="submit" style="background:#6b7280;" title="Создать инструкции только из текстового слоя PDF, без распознавания изображений">Инструкция из текста (без OCR)</button>
+      </form>
+      <form action="{{ url_for('doc_faq_all', doc_id=doc_id) }}" method="post">
+        <button type="submit">FAQ по всем страницам</button>
+      </form>
+    </div>
+    {% if meta.get('last_op') %}
+      <p class="muted">Последняя операция: {{ meta['last_op']['type'] }} (стр. {{ meta['last_op'].get('page','-') }}), delta total={{ meta['last_op']['token_delta']['total_tokens'] }}</p>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <h3>Страницы</h3>
+    <table>
+      <thead><tr><th>Страница</th><th>Файлы</th><th></th></tr></thead>
+      <tbody>
+      {% for p in pages %}
+        <tr>
+          <td>{{ "%03d"|format(p) }}</td>
+          <td class="muted">
+            {% set pd = page_dirs[p] %}
+            {{ "img" if pd['has_img'] else "-" }} /
+            {{ "txt" if pd['has_txt'] else "-" }} /
+            {{ "ocr" if pd['has_ocr'] else "-" }} /
+            {{ "instr" if pd['has_instr'] else "-" }} /
+            {{ "faq" if pd['has_faq'] else "-" }}
+          </td>
+          <td><a href="{{ url_for('page', doc_id=doc_id, page_num=p) }}">Открыть</a></td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</body>
+</html>
+"""
+
+JOB_HTML = """
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <title>Задание {{ job.get('job_id','') }} — Smart PDF Parser</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 24px; }
+    .card { border: 1px solid #e5e7eb; border-radius: 12px; padding: 16px; margin-bottom: 16px; }
+    .muted { color: #6b7280; }
+    .bar { width: 100%; height: 16px; background: #e5e7eb; border-radius: 10px; overflow: hidden; }
+    .fill { height: 16px; background: #111827; width: 0%; }
+    code { background: #f3f4f6; padding: 2px 6px; border-radius: 6px; }
+    a { color: #1d4ed8; text-decoration: none; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div style="display:flex; justify-content: space-between; gap: 16px; align-items:center;">
+      <div>
+        <h2 style="margin:0;">Задание</h2>
+        <div class="muted"><code>{{ job.get('job_id','') }}</code></div>
+      </div>
+      <div>
+        <a href="{{ url_for('index') }}">← на главную</a>
+      </div>
+    </div>
+
+    <p class="muted">
+      Тип: <code>{{ job.get('type','') }}</code> ·
+      Статус: <code id="st">{{ job.get('status','') }}</code>
+    </p>
+
+    <div class="bar"><div class="fill" id="fill"></div></div>
+    <p style="margin-top: 8px;">
+      <strong id="pct">0%</strong>
+      <span class="muted">(<span id="done">0</span>/<span id="total">0</span>)</span>
+    </p>
+    <p class="muted" id="cur"></p>
+    <p class="muted" id="msg"></p>
+    <p style="color:#b91c1c;" id="err"></p>
+
+    <p class="muted">
+      Обновляется автоматически. Если закрыть вкладку, прогресс всё равно сохранится, а страницу можно открыть снова по ссылке.
+    </p>
+  </div>
+
+  <script>
+    async function tick() {
+      const r = await fetch("{{ url_for('job_status', job_id=job.get('job_id','')) }}", { cache: "no-store" });
+      if (!r.ok) return;
+      const j = await r.json();
+      const done = (j.progress && j.progress.done) ? j.progress.done : 0;
+      const total = (j.progress && j.progress.total) ? j.progress.total : 0;
+      const pct = total > 0 ? Math.floor((done * 100) / total) : 0;
+
+      document.getElementById("st").textContent = j.status || "";
+      document.getElementById("done").textContent = done;
+      document.getElementById("total").textContent = total;
+      document.getElementById("pct").textContent = pct + "%";
+      document.getElementById("fill").style.width = pct + "%";
+
+      const cdoc = j.current && j.current.doc_id ? j.current.doc_id : "";
+      const cpage = j.current && j.current.page ? j.current.page : "";
+      document.getElementById("cur").textContent =
+        (cdoc ? ("Документ: " + cdoc + (cpage ? (", страница: " + String(cpage).padStart(3,'0')) : "")) : "");
+
+      document.getElementById("msg").textContent = j.message || "";
+      document.getElementById("err").textContent = j.error || "";
+
+      if (j.status === "running") {
+        setTimeout(tick, 1000);
+      }
+    }
+    tick();
+  </script>
+</body>
+</html>
+"""
+
+WARNING_HTML = """
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <title>Предупреждение — неполная обработка</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 24px; }
+    .card { border: 1px solid #e5e7eb; border-radius: 12px; padding: 16px; margin-bottom: 16px; }
+    .warn { color: #b45309; font-weight: 700; }
+    code { background: #f3f4f6; padding: 2px 6px; border-radius: 6px; }
+    a.btn { display:inline-block; padding: 10px 14px; border-radius: 10px; text-decoration:none; margin-right: 10px; }
+    a.primary { background:#111827; color:#fff; }
+    a.secondary { background:#e5e7eb; color:#111827; }
+    ul { margin: 8px 0 0 18px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2 class="warn">Предупреждение</h2>
+    <p>Не по всем страницам выполнен разбор для выгрузки: <code>{{ kind_label }}</code>.</p>
+    <p>Документ: <code>{{ meta.get('pamphlet_name','document') }}</code>, страниц: <code>{{ meta.get('pages') }}</code></p>
+    <p>Отсутствуют страницы:</p>
+    <ul>
+      {% for p in missing %}
+        <li>{{ "%03d"|format(p) }}</li>
+      {% endfor %}
+    </ul>
+  </div>
+  <div class="card">
+    <a class="btn primary" href="{{ force_url }}">Скачать всё равно</a>
+    <a class="btn secondary" href="{{ back_url }}">Вернуться к документу</a>
+  </div>
+</body>
+</html>
+"""
+
+
+PAGE_HTML = """
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <title>{{ meta.get('pamphlet_name','Документ') }} — стр {{ "%03d"|format(page_num) }}</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 24px; }
+    .card { border: 1px solid #e5e7eb; border-radius: 12px; padding: 16px; margin-bottom: 16px; }
+    .row { display:flex; gap: 16px; flex-wrap: wrap; }
+    .col { flex: 1; min-width: 360px; }
+    img { max-width: 100%; border-radius: 10px; border: 1px solid #e5e7eb; }
+    pre { white-space: pre-wrap; background: #0b1020; color: #e5e7eb; padding: 12px; border-radius: 10px; overflow:auto; }
+    .muted { color: #6b7280; }
+    button { padding: 10px 14px; border: 0; border-radius: 10px; background: #111827; color: #fff; cursor: pointer; }
+    button.secondary { background: #6b7280; }
+    button.success { background: #059669; }
+    button.small { padding: 6px 10px; font-size: 13px; }
+    a { color: #1d4ed8; text-decoration: none; }
+    .bar { display:flex; justify-content: space-between; align-items:center; gap: 12px; flex-wrap: wrap; }
+    .edit-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+    .edit-header h3 { margin: 0; }
+    .edit-buttons { display: flex; gap: 8px; }
+    textarea.edit-area {
+      width: 100%; min-height: 300px; padding: 12px; border-radius: 10px;
+      border: 2px solid #3b82f6; background: #0b1020; color: #e5e7eb;
+      font-family: monospace; font-size: 14px; resize: vertical;
+    }
+    .status-msg { font-size: 13px; margin-left: 8px; }
+    .status-msg.ok { color: #059669; }
+    .status-msg.err { color: #dc2626; }
+    .hidden { display: none; }
+    .nav-bar { display: flex; justify-content: space-between; align-items: center; gap: 16px; flex-wrap: wrap; }
+    .nav-links { display: flex; gap: 12px; align-items: center; }
+    .nav-btn {
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 8px 14px; border-radius: 8px; background: #e5e7eb; color: #111827;
+      text-decoration: none; font-weight: 500; transition: background 0.15s;
+    }
+    .nav-btn:hover { background: #d1d5db; }
+    .nav-btn.disabled { opacity: 0.4; pointer-events: none; }
+    .page-indicator { font-weight: 600; color: #374151; }
+  </style>
+</head>
+<body>
+  <div class="nav-bar" style="margin-bottom: 16px;">
+    <div class="nav-links">
+      <a href="{{ url_for('doc', doc_id=doc_id) }}" class="nav-btn">← К документу</a>
+    </div>
+    <div class="nav-links">
+      {% if prev_page %}
+        <a href="{{ url_for('page', doc_id=doc_id, page_num=prev_page) }}" class="nav-btn">← Пред.</a>
+      {% else %}
+        <span class="nav-btn disabled">← Пред.</span>
+      {% endif %}
+      <span class="page-indicator">{{ "%03d"|format(page_num) }} / {{ "%03d"|format(total_pages) }}</span>
+      {% if next_page %}
+        <a href="{{ url_for('page', doc_id=doc_id, page_num=next_page) }}" class="nav-btn">След. →</a>
+      {% else %}
+        <span class="nav-btn disabled">След. →</span>
+      {% endif %}
+    </div>
+  </div>
+
+  <div class="bar">
+    <h2>{{ meta.get('pamphlet_name','Документ') }} — страница {{ "%03d"|format(page_num) }}</h2>
+  </div>
+
+  <div class="card">
+    <div class="bar">
+      <div class="muted">Модель: {{ meta.get('model') }} | t={{ meta.get('temperature') }} | tokens total={{ meta.get('tokens', {}).get('total_tokens', 0) }}</div>
+      <div class="row">
+        <form action="{{ url_for('ocr_only_page', doc_id=doc_id, page_num=page_num) }}" method="post">
+          <button type="submit" {% if not has_img %}disabled{% endif %}>OCR только</button>
+        </form>
+        <form action="{{ url_for('ocr_table_page', doc_id=doc_id, page_num=page_num) }}" method="post">
+          <button type="submit" {% if not has_img %}disabled{% endif %} style="background:#7c3aed;" title="Распознать таблицу на странице (результат в поле OCR)">🗃️ Распознать таблицу</button>
+        </form>
+        <form action="{{ url_for('instruction_ocr_only_page', doc_id=doc_id, page_num=page_num) }}" method="post">
+          <button type="submit" {% if not has_img %}disabled{% endif %}>Инструкция (OCR only)</button>
+        </form>
+        <form action="{{ url_for('instruction_text_only_page', doc_id=doc_id, page_num=page_num) }}" method="post">
+          <button type="submit" class="secondary" title="Создать инструкцию только из текстового слоя PDF, без распознавания изображения">Инструкция из текста (без OCR)</button>
+        </form>
+        <form action="{{ url_for('instruction_merge_page', doc_id=doc_id, page_num=page_num) }}" method="post">
+          <button type="submit" style="background:#0891b2;" title="Объединить существующий OCR и текстовый слой с приоритетом текста (без повторного OCR)">Merge (текст + OCR)</button>
+        </form>
+        <form action="{{ url_for('process_page', doc_id=doc_id, page_num=page_num) }}" method="post">
+          <button type="submit">Обработать страницу (OCR+Merge + контекст)</button>
+        </form>
+        <form action="{{ url_for('faq_page', doc_id=doc_id, page_num=page_num) }}" method="post">
+          <button type="submit" {% if not has_instruction %}disabled{% endif %}>Сгенерировать FAQ</button>
+        </form>
+      </div>
+    </div>
+    <p class="muted"><strong>Каталог страницы:</strong> <code>{{ page_dir }}</code></p>
+    {% if meta.get('last_error') %}
+      <p style="color:#b91c1c;"><strong>Ошибка:</strong> {{ meta['last_error'] }}</p>
+    {% endif %}
+    {% if meta.get('last_op') %}
+      <p class="muted">Последняя операция: {{ meta['last_op']['type'] }} (стр. {{ meta['last_op'].get('page','-') }}), delta total={{ meta['last_op']['token_delta']['total_tokens'] }}</p>
+    {% endif %}
+  </div>
+
+  <div class="row">
+    <div class="col card">
+      <h3>Скриншот</h3>
+      {% if has_img %}
+        <img src="{{ url_for('page_image', doc_id=doc_id, page_num=page_num) }}" alt="page">
+      {% else %}
+        <p class="muted">Нет page.jpg</p>
+      {% endif %}
+    </div>
+
+    <div class="col card">
+      <div class="edit-header">
+        <h3>Текстовый слой (PDF)</h3>
+        <div class="edit-buttons">
+          <button class="small secondary" onclick="toggleEdit('page_text')">Редактировать</button>
+        </div>
+      </div>
+      <div id="page_text-view">
+        <pre>{{ page_text or "" }}</pre>
+      </div>
+      <div id="page_text-edit" class="hidden">
+        <textarea class="edit-area" id="page_text-textarea">{{ page_text or "" }}</textarea>
+        <div style="margin-top: 8px; display: flex; align-items: center;">
+          <button class="small success" onclick="saveField('page_text')">Сохранить</button>
+          <button class="small secondary" onclick="cancelEdit('page_text')" style="margin-left: 8px;">Отмена</button>
+          <span id="page_text-status" class="status-msg"></span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="row">
+    <div class="col card">
+      <div class="edit-header">
+        <h3>OCR (по скриншоту)</h3>
+        <div class="edit-buttons">
+          {% if ocr_text %}
+            <button class="small secondary" onclick="toggleEdit('ocr')">Редактировать</button>
+          {% endif %}
+        </div>
+      </div>
+      <div id="ocr-view">
+        {% if ocr_text %}
+          <pre>{{ ocr_text }}</pre>
+        {% else %}
+          <p class="muted">Нет OCR для этой страницы. Нажмите «Обработать страницу».</p>
+        {% endif %}
+      </div>
+      <div id="ocr-edit" class="hidden">
+        <textarea class="edit-area" id="ocr-textarea">{{ ocr_text or "" }}</textarea>
+        <div style="margin-top: 8px; display: flex; align-items: center;">
+          <button class="small success" onclick="saveField('ocr')">Сохранить</button>
+          <button class="small secondary" onclick="cancelEdit('ocr')" style="margin-left: 8px;">Отмена</button>
+          <span id="ocr-status" class="status-msg"></span>
+        </div>
+      </div>
+    </div>
+
+    <div class="col card">
+      <div class="edit-header">
+        <h3>Инструкция (merge)</h3>
+        <div class="edit-buttons">
+          {% if instruction %}
+            <button class="small secondary" onclick="toggleEdit('instruction')">Редактировать</button>
+          {% endif %}
+        </div>
+      </div>
+      <div id="instruction-view">
+        {% if instruction %}
+          <pre>{{ instruction }}</pre>
+        {% else %}
+          <p class="muted">Нет инструкции для этой страницы. Нажмите «Обработать страницу».</p>
+        {% endif %}
+      </div>
+      <div id="instruction-edit" class="hidden">
+        <textarea class="edit-area" id="instruction-textarea">{{ instruction or "" }}</textarea>
+        <div style="margin-top: 8px; display: flex; align-items: center;">
+          <button class="small success" onclick="saveField('instruction')">Сохранить</button>
+          <button class="small secondary" onclick="cancelEdit('instruction')" style="margin-left: 8px;">Отмена</button>
+          <span id="instruction-status" class="status-msg"></span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="edit-header">
+      <h3>FAQ</h3>
+      <div class="edit-buttons">
+        {% if faq %}
+          <button class="small secondary" onclick="toggleEdit('faq')">Редактировать</button>
+        {% endif %}
+      </div>
+    </div>
+    <div id="faq-view">
+      {% if faq %}
+        <pre>{{ faq }}</pre>
+      {% else %}
+        <p class="muted">FAQ ещё не сгенерирован. Нажмите «Сгенерировать FAQ» (после обработки страницы).</p>
+      {% endif %}
+    </div>
+    <div id="faq-edit" class="hidden">
+      <textarea class="edit-area" id="faq-textarea" style="min-height: 400px;">{{ faq or "" }}</textarea>
+      <div style="margin-top: 8px; display: flex; align-items: center;">
+        <button class="small success" onclick="saveField('faq')">Сохранить</button>
+        <button class="small secondary" onclick="cancelEdit('faq')" style="margin-left: 8px;">Отмена</button>
+        <span id="faq-status" class="status-msg"></span>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const originalValues = {
+      page_text: {{ page_text|tojson }},
+      ocr: {{ ocr_text|tojson }},
+      instruction: {{ instruction|tojson }},
+      faq: {{ faq|tojson }}
+    };
+
+    function toggleEdit(field) {
+      const viewEl = document.getElementById(field + '-view');
+      const editEl = document.getElementById(field + '-edit');
+      const textarea = document.getElementById(field + '-textarea');
+      const statusEl = document.getElementById(field + '-status');
+
+      if (editEl.classList.contains('hidden')) {
+        viewEl.classList.add('hidden');
+        editEl.classList.remove('hidden');
+        textarea.focus();
+        statusEl.textContent = '';
+      } else {
+        cancelEdit(field);
+      }
+    }
+
+    function cancelEdit(field) {
+      const viewEl = document.getElementById(field + '-view');
+      const editEl = document.getElementById(field + '-edit');
+      const textarea = document.getElementById(field + '-textarea');
+      const statusEl = document.getElementById(field + '-status');
+
+      textarea.value = originalValues[field] || '';
+      editEl.classList.add('hidden');
+      viewEl.classList.remove('hidden');
+      statusEl.textContent = '';
+    }
+
+    async function saveField(field) {
+      const textarea = document.getElementById(field + '-textarea');
+      const statusEl = document.getElementById(field + '-status');
+      const newValue = textarea.value;
+
+      statusEl.textContent = 'Сохранение...';
+      statusEl.className = 'status-msg';
+
+      try {
+        const resp = await fetch("{{ url_for('save_page_field', doc_id=doc_id, page_num=page_num) }}", {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ field: field, content: newValue })
+        });
+
+        const data = await resp.json();
+
+        if (data.ok) {
+          statusEl.textContent = 'Сохранено!';
+          statusEl.className = 'status-msg ok';
+          originalValues[field] = newValue;
+
+          // Обновляем pre в view
+          const viewEl = document.getElementById(field + '-view');
+          const preEl = viewEl.querySelector('pre');
+          if (preEl) {
+            preEl.textContent = newValue;
+          } else if (newValue) {
+            viewEl.innerHTML = '<pre>' + escapeHtml(newValue) + '</pre>';
+          }
+
+          setTimeout(() => {
+            cancelEdit(field);
+          }, 800);
+        } else {
+          statusEl.textContent = 'Ошибка: ' + (data.error || 'неизвестная');
+          statusEl.className = 'status-msg err';
+        }
+      } catch (e) {
+        statusEl.textContent = 'Ошибка сети: ' + e.message;
+        statusEl.className = 'status-msg err';
+      }
+    }
+
+    function escapeHtml(text) {
+      const div = document.createElement('div');
+      div.textContent = text;
+      return div.innerHTML;
+    }
+  </script>
+
+  <!-- Нижняя навигация -->
+  <div class="nav-bar" style="margin-top: 24px; padding-top: 16px; border-top: 1px solid #e5e7eb;">
+    <div class="nav-links">
+      <a href="{{ url_for('doc', doc_id=doc_id) }}" class="nav-btn">← К документу</a>
+    </div>
+    <div class="nav-links">
+      {% if prev_page %}
+        <a href="{{ url_for('page', doc_id=doc_id, page_num=prev_page) }}" class="nav-btn">← Пред.</a>
+      {% else %}
+        <span class="nav-btn disabled">← Пред.</span>
+      {% endif %}
+      <span class="page-indicator">{{ "%03d"|format(page_num) }} / {{ "%03d"|format(total_pages) }}</span>
+      {% if next_page %}
+        <a href="{{ url_for('page', doc_id=doc_id, page_num=next_page) }}" class="nav-btn">След. →</a>
+      {% else %}
+        <span class="nav-btn disabled">След. →</span>
+      {% endif %}
+    </div>
+  </div>
+</body>
+</html>
+"""
+
+
+@app.get("/")
+def index():
+    docs = []
+    for p in sorted(APP_DATA_DIR.iterdir()) if APP_DATA_DIR.exists() else []:
+        if not p.is_dir():
+            continue
+        doc_id = p.name
+        meta = _load_meta(doc_id)
+        if not meta:
+            continue
+        docs.append(
+            {
+                "doc_id": doc_id,
+                "pamphlet_name": meta.get("pamphlet_name", meta.get("filename", doc_id)),
+                "pages": meta.get("pages"),
+                "tokens": meta.get("tokens", {}),
+            }
+        )
+    return render_template_string(INDEX_HTML, docs=docs)
+
+
+@app.post("/upload")
+def upload():
+    files = request.files.getlist("pdfs") or []
+    files = [f for f in files if f and f.filename]
+    if not files:
+        abort(400, "Нужны PDF файлы.")
+
+    model = (request.form.get("model") or "GigaChat-2-Pro").strip()
+    temperature = float(request.form.get("temperature") or 0.01)
+
+    first_doc_id: str | None = None
+    for f in files:
+        if not f.filename.lower().endswith(".pdf"):
+            continue
+        doc_id = str(uuid.uuid4())
+        if first_doc_id is None:
+            first_doc_id = doc_id
+
+        ddir = _doc_dir(doc_id)
+        ddir.mkdir(parents=True, exist_ok=True)
+
+        pdf_path = ddir / "source.pdf"
+        f.save(pdf_path)
+
+        total_pages = _extract_pages(pdf_path, ddir, dpi=150)
+
+        meta = {
+            "doc_id": doc_id,
+            "filename": f.filename,
+            "pamphlet_name": Path(f.filename).stem,
+            "pages": total_pages,
+            "model": model,
+            "temperature": temperature,
+            "tokens": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            "storage_dir": str(ddir),
+        }
+        _save_meta(doc_id, meta)
+
+    return redirect(url_for("index") if first_doc_id is None else url_for("doc", doc_id=first_doc_id))
+
+
+@app.get("/doc/<doc_id>")
+def doc(doc_id: str):
+    meta = _load_meta(doc_id)
+    if not meta:
+        abort(404)
+    pages = list(range(1, int(meta.get("pages", 0)) + 1))
+    page_dirs: Dict[int, Dict[str, bool]] = {}
+    for p in pages:
+        pd = _page_dir(doc_id, p)
+        page_dirs[p] = {
+            "has_img": (pd / "page.jpg").exists(),
+            "has_txt": (pd / "page.txt").exists(),
+            "has_ocr": (pd / "ocr.txt").exists(),
+            "has_instr": (pd / "instruction.txt").exists(),
+            "has_faq": (pd / "faq.md").exists(),
+        }
+    return render_template_string(DOC_HTML, doc_id=doc_id, meta=meta, pages=pages, page_dirs=page_dirs)
+
+
+@app.get("/doc/<doc_id>/page/<int:page_num>")
+def page(doc_id: str, page_num: int):
+    meta = _load_meta(doc_id)
+    if not meta:
+        abort(404)
+    pd = _page_dir(doc_id, page_num)
+    if not pd.exists():
+        abort(404)
+
+    page_text = (pd / "page.txt").read_text(encoding="utf-8") if (pd / "page.txt").exists() else ""
+    ocr_text = (pd / "ocr.txt").read_text(encoding="utf-8") if (pd / "ocr.txt").exists() else ""
+    instruction = (pd / "instruction.txt").read_text(encoding="utf-8") if (pd / "instruction.txt").exists() else ""
+    faq = (pd / "faq.md").read_text(encoding="utf-8") if (pd / "faq.md").exists() else ""
+    has_img = (pd / "page.jpg").exists()
+    has_instruction = (pd / "instruction.txt").exists()
+
+    # Навигация между страницами
+    total_pages = int(meta.get("pages", 0))
+    prev_page = page_num - 1 if page_num > 1 else None
+    next_page = page_num + 1 if page_num < total_pages else None
+
+    return render_template_string(
+        PAGE_HTML,
+        doc_id=doc_id,
+        page_num=page_num,
+        meta=meta,
+        has_img=has_img,
+        has_instruction=has_instruction,
+        page_dir=str(pd),
+        page_text=page_text,
+        ocr_text=ocr_text,
+        instruction=instruction,
+        faq=faq,
+        prev_page=prev_page,
+        next_page=next_page,
+        total_pages=total_pages,
+    )
+
+
+@app.get("/doc/<doc_id>/page/<int:page_num>/image")
+def page_image(doc_id: str, page_num: int):
+    pd = _page_dir(doc_id, page_num)
+    img = pd / "page.jpg"
+    if not img.exists():
+        abort(404)
+    return send_file(img, mimetype="image/jpeg")
+
+
+@app.get("/doc/<doc_id>/download/instruction")
+def download_instruction(doc_id: str):
+    meta = _load_meta(doc_id)
+    if not meta:
+        abort(404)
+    missing = _missing_pages(doc_id, "instruction")
+    if missing and request.args.get("force") != "1":
+        return render_template_string(
+            WARNING_HTML,
+            meta=meta,
+            missing=missing,
+            kind_label="instruction.txt",
+            force_url=url_for("download_instruction", doc_id=doc_id, force=1),
+            back_url=url_for("doc", doc_id=doc_id),
+        )
+    md = _build_instruction_export_md(doc_id)
+    filename = f"{meta.get('pamphlet_name','document')}_instruction.md"
+    return send_file(
+        BytesIO(md.encode("utf-8")),
+        mimetype="text/markdown; charset=utf-8",
+        as_attachment=True,
+        download_name=filename,
+    )
+
+@app.get("/doc/<doc_id>/download/instruction.docx")
+def download_instruction_docx(doc_id: str):
+    meta = _load_meta(doc_id)
+    if not meta:
+        abort(404)
+    missing = _missing_pages(doc_id, "instruction")
+    if missing and request.args.get("force") != "1":
+        return render_template_string(
+            WARNING_HTML,
+            meta=meta,
+            missing=missing,
+            kind_label="instruction (.docx)",
+            force_url=url_for("download_instruction_docx", doc_id=doc_id, force=1),
+            back_url=url_for("doc", doc_id=doc_id),
+        )
+
+    md = _build_instruction_export_md(doc_id)
+    title = str(meta.get("pamphlet_name", "Instruction"))
+    docx_bytes = _render_docx_from_markdown(md, title=title)
+    filename = f"{meta.get('pamphlet_name','document')}_instruction.docx"
+    return send_file(
+        BytesIO(docx_bytes),
+        mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        as_attachment=True,
+        download_name=filename,
+    )
+
+
+@app.get("/doc/<doc_id>/download/faq")
+def download_faq(doc_id: str):
+    meta = _load_meta(doc_id)
+    if not meta:
+        abort(404)
+    missing = _missing_pages(doc_id, "faq")
+    if missing and request.args.get("force") != "1":
+        return render_template_string(
+            WARNING_HTML,
+            meta=meta,
+            missing=missing,
+            kind_label="faq.md",
+            force_url=url_for("download_faq", doc_id=doc_id, force=1),
+            back_url=url_for("doc", doc_id=doc_id),
+        )
+    md = _build_faq_export_md(doc_id)
+    filename = f"{meta.get('pamphlet_name','document')}_faq.md"
+    return send_file(
+        BytesIO(md.encode("utf-8")),
+        mimetype="text/markdown; charset=utf-8",
+        as_attachment=True,
+        download_name=filename,
+    )
+
+@app.get("/doc/<doc_id>/download/faq.xlsx")
+def download_faq_xlsx(doc_id: str):
+    meta = _load_meta(doc_id)
+    if not meta:
+        abort(404)
+    missing = _missing_pages(doc_id, "faq")
+    if missing and request.args.get("force") != "1":
+        return render_template_string(
+            WARNING_HTML,
+            meta=meta,
+            missing=missing,
+            kind_label="faq.md",
+            force_url=url_for("download_faq_xlsx", doc_id=doc_id, force=1),
+            back_url=url_for("doc", doc_id=doc_id),
+        )
+
+    md = _build_faq_export_md(doc_id)
+    rows = _parse_faq_md_to_rows(md)
+    xlsx_bytes = _rows_to_xlsx_bytes(rows)
+    filename = f"{meta.get('pamphlet_name','document')}_faq.xlsx"
+    return send_file(
+        BytesIO(xlsx_bytes),
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        as_attachment=True,
+        download_name=filename,
+    )
+
+@app.post("/doc/<doc_id>/page/<int:page_num>/process")
+def process_page(doc_id: str, page_num: int):
+    try:
+        _process_page(doc_id, page_num, force=True)  # Перезаписываем существующие файлы
+        meta = _load_meta(doc_id)
+        if meta.get("last_error"):
+            meta.pop("last_error", None)
+            _save_meta(doc_id, meta)
+    except Exception as e:
+        meta = _load_meta(doc_id)
+        meta["last_error"] = str(e)
+        _save_meta(doc_id, meta)
+    return redirect(url_for("page", doc_id=doc_id, page_num=page_num))
+
+
+@app.post("/doc/<doc_id>/page/<int:page_num>/ocr")
+def ocr_only_page(doc_id: str, page_num: int):
+    try:
+        _ocr_only_page(doc_id, page_num, force=True)  # Перезаписываем существующие файлы
+        meta = _load_meta(doc_id)
+        if meta.get("last_error"):
+            meta.pop("last_error", None)
+            _save_meta(doc_id, meta)
+    except Exception as e:
+        meta = _load_meta(doc_id)
+        meta["last_error"] = str(e)
+        _save_meta(doc_id, meta)
+    return redirect(url_for("page", doc_id=doc_id, page_num=page_num))
+
+
+@app.post("/doc/<doc_id>/page/<int:page_num>/ocr_table")
+def ocr_table_page(doc_id: str, page_num: int):
+    """Распознать таблицу на странице. Результат сохраняется в ocr.txt."""
+    try:
+        meta = _load_meta(doc_id)
+        model = meta.get("model") or os.getenv("GIGA_VISION_MODEL", "GigaChat-2-Pro")
+        temperature = float(meta.get("temperature", 0.01))
+        pamphlet_name = meta.get("pamphlet_name", meta.get("filename", "document"))
+
+        page_dir = _page_dir(doc_id, page_num)
+        img_path = page_dir / "page.jpg"
+        if not img_path.exists():
+            raise FileNotFoundError("Не найден файл страницы (page.jpg).")
+
+        token = _ensure_access_token()
+        before = get_token_stats()
+
+        # Используем table_parser для распознавания таблицы
+        table_text = parse_table_from_image(
+            str(img_path),
+            access_token=token,
+            output_format="markdown",
+            model=model,
+            temperature=temperature,
+            context=f"Таблица из памятки «{pamphlet_name}», страница {page_num}",
+        )
+
+        # Сохраняем результат в ocr.txt
+        ocr_path = page_dir / "ocr.txt"
+        ocr_path.write_text(table_text, encoding="utf-8")
+
+        after = get_token_stats()
+        delta = _token_delta(before, after)
+        _add_tokens(meta, delta)
+        meta["last_op"] = {"type": "ocr_table", "page": page_num, "token_delta": delta}
+
+        if meta.get("last_error"):
+            meta.pop("last_error", None)
+        _save_meta(doc_id, meta)
+
+    except Exception as e:
+        meta = _load_meta(doc_id)
+        meta["last_error"] = str(e)
+        _save_meta(doc_id, meta)
+
+    return redirect(url_for("page", doc_id=doc_id, page_num=page_num))
+
+
+@app.post("/doc/<doc_id>/page/<int:page_num>/instruction_ocr")
+def instruction_ocr_only_page(doc_id: str, page_num: int):
+    try:
+        token = _ensure_access_token()
+        _instruction_from_ocr_only_page(doc_id, page_num, access_token=token, force=True)  # Перезаписываем
+        meta = _load_meta(doc_id)
+        if meta.get("last_error"):
+            meta.pop("last_error", None)
+            _save_meta(doc_id, meta)
+    except Exception as e:
+        meta = _load_meta(doc_id)
+        meta["last_error"] = str(e)
+        _save_meta(doc_id, meta)
+    return redirect(url_for("page", doc_id=doc_id, page_num=page_num))
+
+
+@app.post("/doc/<doc_id>/page/<int:page_num>/instruction_text")
+def instruction_text_only_page(doc_id: str, page_num: int):
+    """Создать инструкцию только из текстового слоя PDF (без OCR), с форматированием через LLM."""
+    try:
+        token = _ensure_access_token()
+        _instruction_from_text_layer_page(doc_id, page_num, access_token=token, force=True)
+        meta = _load_meta(doc_id)
+        if meta.get("last_error"):
+            meta.pop("last_error", None)
+            _save_meta(doc_id, meta)
+    except Exception as e:
+        meta = _load_meta(doc_id)
+        meta["last_error"] = str(e)
+        _save_meta(doc_id, meta)
+    return redirect(url_for("page", doc_id=doc_id, page_num=page_num))
+
+
+@app.post("/doc/<doc_id>/page/<int:page_num>/instruction_merge")
+def instruction_merge_page(doc_id: str, page_num: int):
+    """Создать инструкцию из существующего OCR и текстового слоя (merge с приоритетом текста)."""
+    try:
+        token = _ensure_access_token()
+        _instruction_merge_existing_ocr_page(doc_id, page_num, access_token=token, force=True)
+        meta = _load_meta(doc_id)
+        if meta.get("last_error"):
+            meta.pop("last_error", None)
+            _save_meta(doc_id, meta)
+    except Exception as e:
+        meta = _load_meta(doc_id)
+        meta["last_error"] = str(e)
+        _save_meta(doc_id, meta)
+    return redirect(url_for("page", doc_id=doc_id, page_num=page_num))
+
+
+@app.post("/doc/<doc_id>/page/<int:page_num>/faq")
+def faq_page(doc_id: str, page_num: int):
+    try:
+        _generate_faq_for_page(doc_id, page_num, force=True)  # Перезаписываем существующий FAQ
+        meta = _load_meta(doc_id)
+        if meta.get("last_error"):
+            meta.pop("last_error", None)
+            _save_meta(doc_id, meta)
+    except Exception as e:
+        meta = _load_meta(doc_id)
+        meta["last_error"] = str(e)
+        _save_meta(doc_id, meta)
+    return redirect(url_for("page", doc_id=doc_id, page_num=page_num))
+
+
+@app.post("/doc/<doc_id>/page/<int:page_num>/save")
+def save_page_field(doc_id: str, page_num: int):
+    """
+    API для сохранения отредактированных текстовых фрагментов страницы.
+    Принимает JSON: { "field": "ocr"|"instruction"|"faq"|"page_text", "content": "..." }
+    """
+    meta = _load_meta(doc_id)
+    if not meta:
+        return jsonify({"ok": False, "error": "Документ не найден"}), 404
+
+    pd = _page_dir(doc_id, page_num)
+    if not pd.exists():
+        return jsonify({"ok": False, "error": "Страница не найдена"}), 404
+
+    data = request.get_json(silent=True) or {}
+    field = data.get("field", "").strip()
+    content = data.get("content", "")
+
+    # Маппинг полей на файлы
+    field_to_file = {
+        "ocr": "ocr.txt",
+        "instruction": "instruction.txt",
+        "faq": "faq.md",
+        "page_text": "page.txt",
+    }
+
+    if field not in field_to_file:
+        return jsonify({"ok": False, "error": f"Неизвестное поле: {field}"}), 400
+
+    filename = field_to_file[field]
+    filepath = pd / filename
+
+    try:
+        filepath.write_text(content, encoding="utf-8")
+        return jsonify({"ok": True, "field": field, "saved_to": str(filepath)})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.get("/job/<job_id>")
+def job(job_id: str):
+    j = _job_load(job_id)
+    if not j:
+        abort(404)
+    return render_template_string(JOB_HTML, job=j)
+
+
+@app.get("/job/<job_id>/status")
+def job_status(job_id: str):
+    j = _job_load(job_id)
+    if not j:
+        abort(404)
+    return jsonify(j)
+
+
+@app.post("/doc/<doc_id>/process_all")
+def doc_process_all(doc_id: str):
+    # запускаем в фоне и показываем прогресс
+    existing = _find_running_job_for_doc(doc_id)
+    if existing:
+        return redirect(url_for("job", job_id=existing))
+    j = _new_job("process_docs", {"doc_ids": [doc_id]})
+    _start_job_thread(j["job_id"], _job_worker_process_docs, [doc_id])
+    return redirect(url_for("job", job_id=j["job_id"]))
+
+
+@app.post("/doc/<doc_id>/ocr_only_all")
+def doc_ocr_only_all(doc_id: str):
+    existing = _find_running_job_for_doc(doc_id)
+    if existing:
+        return redirect(url_for("job", job_id=existing))
+    j = _new_job("ocr_only_docs", {"doc_ids": [doc_id]})
+    _start_job_thread(j["job_id"], _job_worker_ocr_only_docs, [doc_id])
+    return redirect(url_for("job", job_id=j["job_id"]))
+
+
+@app.post("/doc/<doc_id>/instruction_ocr_only_all")
+def doc_instruction_ocr_only_all(doc_id: str):
+    existing = _find_running_job_for_doc(doc_id)
+    if existing:
+        return redirect(url_for("job", job_id=existing))
+    j = _new_job("instr_ocr_only_docs", {"doc_ids": [doc_id]})
+    _start_job_thread(j["job_id"], _job_worker_instr_ocr_only_docs, [doc_id])
+    return redirect(url_for("job", job_id=j["job_id"]))
+
+
+@app.post("/doc/<doc_id>/instruction_text_only_all")
+def doc_instruction_text_only_all(doc_id: str):
+    """Создать инструкции из текстового слоя PDF (без OCR) для всех страниц."""
+    existing = _find_running_job_for_doc(doc_id)
+    if existing:
+        return redirect(url_for("job", job_id=existing))
+    j = _new_job("instr_text_only_docs", {"doc_ids": [doc_id]})
+    _start_job_thread(j["job_id"], _job_worker_instr_text_only_docs, [doc_id])
+    return redirect(url_for("job", job_id=j["job_id"]))
+
+
+@app.post("/doc/<doc_id>/faq_all")
+def doc_faq_all(doc_id: str):
+    existing = _find_running_job_for_doc(doc_id)
+    if existing:
+        return redirect(url_for("job", job_id=existing))
+    j = _new_job("faq_docs", {"doc_ids": [doc_id]})
+    _start_job_thread(j["job_id"], _job_worker_faq_docs, [doc_id])
+    return redirect(url_for("job", job_id=j["job_id"]))
+
+
+@app.post("/batch/process_docs")
+def batch_process_docs():
+    doc_ids = request.form.getlist("doc_id")
+    action = request.form.get("action") or "process"
+    if not doc_ids:
+        return redirect(url_for("index"))
+
+    conflicts = []
+    for did in doc_ids:
+        existing = _find_running_job_for_doc(did)
+        if existing:
+            conflicts.append({"doc_id": did, "job_id": existing})
+    if conflicts:
+        return render_template_string(
+            JOB_CONFLICT_HTML,
+            conflicts=conflicts,
+            back_url=url_for("index"),
+        )
+    if action == "faq":
+        j = _new_job("faq_docs", {"doc_ids": doc_ids})
+        _start_job_thread(j["job_id"], _job_worker_faq_docs, doc_ids)
+    elif action == "ocr_only":
+        j = _new_job("ocr_only_docs", {"doc_ids": doc_ids})
+        _start_job_thread(j["job_id"], _job_worker_ocr_only_docs, doc_ids)
+    elif action == "instr_text_only":
+        j = _new_job("instr_text_only_docs", {"doc_ids": doc_ids})
+        _start_job_thread(j["job_id"], _job_worker_instr_text_only_docs, doc_ids)
+    elif action == "instr_ocr_only":
+        j = _new_job("instr_ocr_only_docs", {"doc_ids": doc_ids})
+        _start_job_thread(j["job_id"], _job_worker_instr_ocr_only_docs, doc_ids)
+    else:
+        j = _new_job("process_docs", {"doc_ids": doc_ids})
+        _start_job_thread(j["job_id"], _job_worker_process_docs, doc_ids)
+    return redirect(url_for("job", job_id=j["job_id"]))
+
+
+def main():
+    host = os.getenv("WEB_HOST", "127.0.0.1")
+    port = int(os.getenv("WEB_PORT", "8000"))
+    _setup_logging()
+    _startup_check_gigachat()
+    app.run(host=host, port=port, debug=False)
+
+
+def _startup_check_gigachat() -> None:
+    """
+    Проверка доступности GigaChat при старте приложения.
+    Можно отключить через GIGA_STARTUP_CHECK=0.
+    Если GIGA_STARTUP_FAIL=1 — падать при ошибке.
+    """
+    enabled = (os.getenv("GIGA_STARTUP_CHECK", "1") or "").strip().lower() not in ("0", "false", "no", "off")
+    fail_on_error = (os.getenv("GIGA_STARTUP_FAIL", "0") or "").strip().lower() in ("1", "true", "yes", "on")
+    if not enabled:
+        return
+
+    try:
+        creds = get_creds()
+        access_token = creds.get("access_token")
+        auth_mode = str(creds.get("auth_mode") or "token")
+        if not access_token and auth_mode != "cert":
+            raise RuntimeError(f"Токен не получен от NGW. Ответ: {creds}")
+
+        # Текстовый ping. В cert-режиме может идти без Bearer-токена.
+        resp = giga_free_answer(
+            question="ping",
+            access_token=access_token,
+            sys_prompt="Ответь одним словом: pong.",
+            max_tokens=5,
+            temperature=0.0,
+        )
+        if not str(resp).strip():
+            raise RuntimeError("Пустой ответ от GigaChat.")
+        print("GigaChat: проверка подключения успешна.")
+    except Exception as e:
+        msg = f"GigaChat: проверка подключения неуспешна: {e}"
+        if fail_on_error:
+            raise RuntimeError(msg) from e
+        print(msg)
+
+
+if __name__ == "__main__":
+    main()
+
+
